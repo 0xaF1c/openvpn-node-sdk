@@ -1,0 +1,10 @@
+{
+  "name": "@ovpn-sdk/binary",
+  "version": "0.1.0",
+  "description": "OpenVPN binary resolution and platform package lookup",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": { ".": "./src/index.ts" }
+}

@@ -1,0 +1,13 @@
+# dependencies / build output
+node_modules/
+.npm-cache/
+dist/
+*.tsbuildinfo
+coverage/
+.reports/*
+# reference OpenVPN source tree (kept local, has its own .git)
+.reference/
+
+# misc
+*.log
+.DS_Store

@@ -1,0 +1,11 @@
+{
+  "name": "@ovpn-sdk/openvpn-darwin-arm64",
+  "version": "0.1.0",
+  "description": "OpenVPN darwin-arm64 binary platform package (placeholder, no binaries yet)",
+  "license": "GPL-2.0-only",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "bin"
+  ]
+}
