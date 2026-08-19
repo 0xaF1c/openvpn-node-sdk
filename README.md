@@ -300,6 +300,21 @@ npm run typecheck     # tsc --noEmit
 npm run build         # compile packages/*/src -> packages/*/dist
 ```
 
+### Running the quick start locally (before npm publish)
+
+The package is not published yet; link it from this repo:
+
+```bash
+# 1. In this repository:
+node scripts/link-local.mjs
+
+# 2. In your test project:
+npm link openvpn-node-sdk
+```
+
+Make sure your test project package.json has `"type": "module"` (the SDK is
+ESM-only). Then `node index.js` from the quick-start examples works.
+
 Real-OpenVPN smoke test:
 
 ```bash
