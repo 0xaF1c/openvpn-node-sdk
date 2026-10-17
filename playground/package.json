@@ -1,0 +1,16 @@
+{
+  "name": "openvpn-node-sdk-playground",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manual end-to-end scenarios for the OpenVPN Node.js SDK",
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "config": "node scripts/config.mjs",
+    "mock": "node scripts/mock-flow.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "connect": "node scripts/connect.mjs",
+    "adapters": "node scripts/adapters.mjs",
+    "offline": "node scripts/check.mjs && node scripts/config.mjs && node scripts/mock-flow.mjs"
+  }
+}

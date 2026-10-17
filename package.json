@@ -14,7 +14,15 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test --test-isolation=none \"packages/**/src/**/*.test.ts\"",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "playground": "node playground/scripts/mock-flow.mjs",
+    "playground:mock": "node playground/scripts/mock-flow.mjs",
+    "playground:check": "node playground/scripts/check.mjs",
+    "playground:config": "node playground/scripts/config.mjs",
+    "playground:smoke": "node playground/scripts/smoke.mjs",
+    "playground:connect": "node playground/scripts/connect.mjs",
+    "playground:adapters": "node playground/scripts/adapters.mjs",
+    "playground:offline": "node playground/scripts/check.mjs && node playground/scripts/config.mjs && node playground/scripts/mock-flow.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

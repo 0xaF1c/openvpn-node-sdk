@@ -330,6 +330,26 @@ node scripts/prepare-release.mjs --dry-run
 node scripts/prepare-release.mjs   # points packages at dist/, adds os/cpu to platform packages
 ```
 
+### Playground (manual end-to-end scenarios)
+
+`playground/` contains consumer-style scripts that import the SDK by package
+name and exercise it end to end, separately from the unit tests. Nothing needs
+to be installed: resolution goes through the workspace `node_modules`.
+
+```bash
+npm run playground          # mock management server + fake process (offline)
+npm run playground:offline  # check + config + mock, chained
+npm run playground:check    # environment / resolution / API surface report
+npm run playground:smoke    # real binary, dev-null config (--dry-run to preview)
+npm run playground:connect -- --config <profile.ovpn>
+npm run playground:adapters list        # Windows; needs an elevated shell
+```
+
+Offline scenarios run anywhere; the real-binary ones need an OpenVPN
+installation (bundled on Windows x64) and an environment where spawning child
+processes is allowed. See [`playground/README.md`](playground/README.md) for the
+full matrix, exit codes and known behaviors.
+
 ## License
 
 SDK packages: MIT. Bundled OpenVPN binaries and platform packages: GPL-2.0-only.
