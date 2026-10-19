@@ -346,9 +346,10 @@ npm config set //registry.npmjs.org:_authToken npm_xxx
 npm run publish:packages -- --yes                     # no OTP needed
 ```
 
-The `@ovpn-sdk` scope must exist before the first scoped publish. If npm answers
-`404 Scope not found`, create a free organization named `ovpn-sdk` on npmjs.com
-(Organizations → Create organization) and retry.
+The `@ovpn-sdk` scope must exist before the first scoped publish. npm answers
+`404 Not Found - PUT` when the publishing account does not own the scope (it does not
+say "permission denied"): create a free organization named `ovpn-sdk` on npmjs.com
+(Organizations → Create organization), confirm with `npm org ls ovpn-sdk`, then retry.
 
 Workspace packages publish only `files: ["dist"]`: `dist/` is gitignored, so npm would
 otherwise leave the build output out of the tarball while `main` points at it.

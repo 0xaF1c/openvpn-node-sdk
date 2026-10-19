@@ -64,6 +64,20 @@ function publishOrder(openvpn) {
   return [...CORE_PACKAGES, ...platformNames, FACADE_PACKAGE];
 }
 
+/** Turn npm's stderr into an actionable hint. */
+function describeFailure(output) {
+  if (/EOTP|one-time password/i.test(output)) {
+    return 'npm requires a one-time password (2FA mode auth-and-writes): pass --otp <code>, or configure an automation token so the batch can run unattended';
+  }
+  if (/E404/.test(output) && /%2f/i.test(output)) {
+    return 'the @scope is not owned by this npm account (404 on PUT): create an organization with that scope name on npmjs.com, or publish under a scope you own';
+  }
+  if (/E403|Forbidden/i.test(output)) {
+    return 'the registry refused the publish (403): check that you own the scope and that the package name is available';
+  }
+  return 'resolve the error above';
+}
+
 function main() {
   const openvpn = validateManifest(loadManifest());
   const rootPackage = readJson(path.join(ROOT, 'package.json'));
@@ -119,10 +133,7 @@ function main() {
     if (result.stderr) process.stderr.write(result.stderr);
     if (result.status !== 0) {
       const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-      const hint = /EOTP|one-time password/i.test(output)
-        ? 'npm requires a one-time password (2FA mode auth-and-writes): pass --otp <code>, or configure an automation token so the batch can run unattended'
-        : 'resolve the error above';
-      problems.push(`${label}: publish failed (${hint}); retry with --only ${name}`);
+      problems.push(`${label}: publish failed (${describeFailure(output)}); retry with --only ${name}`);
       break;
     }
   }
