@@ -139,3 +139,52 @@ describe('platform package metadata', () => {
     );
   });
 });
+
+describe('bundled vendor directory', () => {
+  const target = () => `${process.platform}-${process.arch}`;
+  const exeName = () => (process.platform === 'win32' ? 'openvpn.exe' : 'openvpn');
+
+  async function makeVendor(version: string) {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-vendor-'));
+    const binDir = path.join(dir, `openvpn-${target()}`, 'bin');
+    await mkdir(binDir, { recursive: true });
+    const binary = path.join(binDir, exeName());
+    await writeFile(binary, '');
+    await writeFile(
+      path.join(dir, 'openvpn.json'),
+      JSON.stringify({ openvpnVersion: version, platforms: { [target()]: { version, files: [exeName()] } } }),
+      'utf8',
+    );
+    return { dir, binary };
+  }
+
+  it('resolves the vendored binary together with its pinned version', async () => {
+    const { dir, binary } = await makeVendor('2.7.5');
+    const mgr = new BinaryManager({ vendorDir: dir, platformResolver: () => null });
+    assert.deepEqual(mgr.resolveOpenVpn(), { path: binary, source: 'bundled', version: '2.7.5' });
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('rejects a bundled version that does not satisfy expectedVersion', async () => {
+    const { dir } = await makeVendor('2.6.12');
+    const mismatch = new BinaryManager({ vendorDir: dir, platformResolver: () => null, expectedVersion: '2.7.5' });
+    assert.throws(() => mismatch.resolveOpenVpn(), /expected OpenVPN 2\.7\.5, but the bundled binaries provide 2\.6\.12/);
+
+    const match = new BinaryManager({ vendorDir: dir, platformResolver: () => null, expectedVersion: '2.6.12' });
+    assert.equal(match.resolveOpenVpn().version, '2.6.12');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('ignores a vendor directory without a manifest', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-vendor-empty-'));
+    const mgr = new BinaryManager({ vendorDir: dir, platformResolver: () => null });
+    let resolved: ReturnType<BinaryManager['resolveOpenVpn']> | null = null;
+    try {
+      resolved = mgr.resolveOpenVpn();
+    } catch {
+      resolved = null;
+    }
+    assert.ok(resolved === null || resolved.source !== 'bundled');
+    await rm(dir, { recursive: true, force: true });
+  });
+});

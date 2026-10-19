@@ -109,7 +109,7 @@ function checkTarget(openvpn, target) {
     check(`${target}: os is ${spec.os}`, pkg.os?.length === 1 && pkg.os[0] === spec.os, JSON.stringify(pkg.os));
     check(`${target}: cpu is ${spec.cpu}`, pkg.cpu?.length === 1 && pkg.cpu[0] === spec.cpu, JSON.stringify(pkg.cpu));
   } else {
-    skip(`${target}: os/cpu are added at publish time by prepare-release.mjs`);
+    skip(`${target}: os/cpu are not used by the single-package build (binaries are vendored)`);
   }
 
   const indexPath = path.join(dir, 'index.js');
@@ -156,32 +156,35 @@ function checkTarget(openvpn, target) {
   check(`${target}: binary reports OpenVPN ${openvpn.version}`, detected.version === openvpn.version, String(detected.version));
 }
 
-function checkOptionalDependencies(openvpn) {
-  console.log('\n== optionalDependencies');
+function checkSinglePackageMetadata(openvpn) {
+  console.log('\n== single-package metadata');
   const pkgFile = path.join(SDK_PACKAGE_DIR, 'package.json');
   if (!existsSync(pkgFile)) {
     check('openvpn-node-sdk package.json exists', false, pkgFile);
     return;
   }
   const pkg = readJson(pkgFile);
-  const deps = pkg.optionalDependencies ?? {};
-  const expectedVersion = platformPackageVersion(openvpn);
+  const platformDependencies = Object.entries(pkg.optionalDependencies ?? {}).filter(([name]) => name.startsWith('@ovpn-sdk/'));
+  check(
+    'openvpn-node-sdk does not declare scoped platform packages',
+    platformDependencies.length === 0,
+    JSON.stringify(platformDependencies),
+  );
 
-  for (const [target, spec] of Object.entries(openvpn.platforms)) {
-    const name = platformPackageName(target);
-    if (isReady(spec)) {
-      check(`${name} is pinned to ${expectedVersion}`, deps[name] === expectedVersion, String(deps[name]));
-    } else {
-      check(`${name} is not listed while "${spec.source}"`, deps[name] === undefined, String(deps[name]));
-    }
+  const vendorMeta = path.join(SDK_PACKAGE_DIR, 'vendor', 'openvpn.json');
+  if (!existsSync(vendorMeta)) {
+    skip('vendor/ is not built (run `npm run build:single` to check the bundled binaries)');
+    return;
   }
-
-  for (const [name, version] of Object.entries(deps)) {
-    if (!name.startsWith('@ovpn-sdk/openvpn-')) continue;
-    const target = name.slice('@ovpn-sdk/openvpn-'.length);
-    if (!openvpn.platforms[target]) {
-      check(`optional dependency ${name} maps to a known platform`, false, `version ${version}`);
-    }
+  const meta = readJson(vendorMeta);
+  for (const [target, spec] of Object.entries(openvpn.platforms)) {
+    if (!isReady(spec)) continue;
+    check(`vendor contains ${target}`, meta.platforms?.[target] !== undefined);
+    check(
+      `vendor ${target} pins ${openvpn.version}`,
+      meta.platforms?.[target]?.version === openvpn.version,
+      String(meta.platforms?.[target]?.version),
+    );
   }
 }
 
@@ -206,7 +209,7 @@ function main() {
   console.log(`verifying platform packages against openvpn-binaries.json (OpenVPN ${openvpn.version}-${openvpn.packaging})`);
   for (const target of targets) checkTarget(openvpn, target);
   checkDiskOnlyTargets(openvpn);
-  if (!targetFilter) checkOptionalDependencies(openvpn);
+  if (!targetFilter) checkSinglePackageMetadata(openvpn);
 
   console.log(
     `\n${checks - failures} passed, ${failures} failed, ${warnings} warnings, ${skips} skipped` +

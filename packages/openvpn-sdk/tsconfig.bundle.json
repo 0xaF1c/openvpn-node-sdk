@@ -1,0 +1,27 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "..",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": [
+    "../binary/src/**/*.ts",
+    "../config/src/**/*.ts",
+    "../core/src/**/*.ts",
+    "../openvpn-sdk/src/**/*.ts",
+    "../process/src/**/*.ts",
+    "../tap/src/**/*.ts"
+  ],
+  "exclude": [
+    "../*/src/__tests__/**"
+  ]
+}

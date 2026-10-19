@@ -11,11 +11,5 @@
   "openvpnVersion": "2.7.5",
   "publishConfig": {
     "access": "public"
-  },
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "arm64"
-  ]
+  }
 }

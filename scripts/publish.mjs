@@ -1,36 +1,22 @@
 #!/usr/bin/env node
 /**
- * Publish the SDK packages in dependency order.
+ * Publish the single, self-contained `openvpn-node-sdk` package.
  *
- * The monorepo root is `private` on purpose: it has no entry point and must not
- * be installed. Publish the workspace packages instead.
+ * Everything (@ovpn-sdk/* modules and the pinned OpenVPN binaries) is bundled
+ * into dist/ + vendor/, so publishing needs no scoped packages, no organization
+ * and no runtime dependencies.
  *
  *   node scripts/publish.mjs --dry-run
  *   node scripts/publish.mjs --yes [--tag latest] [--otp 123456] [--provenance]
- *   node scripts/publish.mjs --yes --only openvpn-node-sdk
  *
- * Accounts with 2FA mode "auth-and-writes" (see `npm profile get`) must pass a
- * fresh --otp for every package, or configure an automation token so the batch
- * can run unattended.
- *
- * Preconditions per package: `main` must point at dist/ (run
- * `npm run build && node scripts/prepare-release.mjs` first) and dist/index.js
- * must exist. Packages publish only their `dist` directory (`files: ["dist"]`),
- * because dist/ is gitignored and npm would otherwise leave it out of the tarball.
+ * Preconditions: `npm run build:single && node scripts/prepare-release.mjs`.
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { isReady, loadManifest, parseArgs, platformPackageName, ROOT, validateManifest } from './lib/openvpn-manifest.mjs';
+import { parseArgs, ROOT } from './lib/openvpn-manifest.mjs';
 
-/** Quote an argv token only when it contains characters a shell could interpret. */
-function shellQuote(value) {
-  return /^[A-Za-z0-9@/._:=+-]+$/.test(value) ? value : `"${value.replaceAll('"', '\\"')}"`;
-}
-
-// Internal packages first, facade last, platform packages in between.
-const CORE_PACKAGES = ['@ovpn-sdk/binary', '@ovpn-sdk/process', '@ovpn-sdk/core', '@ovpn-sdk/config', '@ovpn-sdk/tap'];
-const FACADE_PACKAGE = 'openvpn-node-sdk';
+const PACKAGE_NAME = 'openvpn-node-sdk';
 
 const args = parseArgs();
 const yes = args.has('yes');
@@ -38,7 +24,11 @@ const dryRun = !yes || args.has('dry-run');
 const tag = args.get('tag', 'latest');
 const otp = args.get('otp');
 const provenance = args.has('provenance');
-const only = args.get('only');
+
+/** Quote an argv token only when it contains characters a shell could interpret. */
+function shellQuote(value) {
+  return /^[A-Za-z0-9@/._:=+-]+$/.test(value) ? value : `"${value.replaceAll('"', '\\"')}"`;
+}
 
 function readJson(file) {
   return JSON.parse(readFileSync(file, 'utf8'));
@@ -57,95 +47,96 @@ function workspaceDir(name) {
   throw new Error(`cannot find workspace package ${name}`);
 }
 
-function publishOrder(openvpn) {
-  const platformNames = Object.entries(openvpn.platforms)
-    .filter(([, spec]) => isReady(spec))
-    .map(([target]) => platformPackageName(target));
-  return [...CORE_PACKAGES, ...platformNames, FACADE_PACKAGE];
-}
-
 /** Turn npm's stderr into an actionable hint. */
 function describeFailure(output) {
   if (/EOTP|one-time password/i.test(output)) {
-    return 'npm requires a one-time password (2FA mode auth-and-writes): pass --otp <code>, or configure an automation token so the batch can run unattended';
+    return 'npm requires a one-time password (2FA mode auth-and-writes): pass --otp <code>, or create a token that does not bypass 2FA';
   }
   if (/E404/.test(output) && /%2f/i.test(output)) {
-    return 'the @scope is not owned by this npm account (404 on PUT): create an organization with that scope name on npmjs.com, or publish under a scope you own';
+    return 'the @scope is not owned by this npm account (404 on PUT): create an organization with that scope name on npmjs.com';
   }
   if (/E403|Forbidden/i.test(output)) {
-    return 'the registry refused the publish (403): check that you own the scope and that the package name is available';
+    return 'the registry refused the publish (403): check that the package name is available and that you are logged in';
   }
   return 'resolve the error above';
 }
 
 function main() {
-  const openvpn = validateManifest(loadManifest());
-  const rootPackage = readJson(path.join(ROOT, 'package.json'));
-  if (rootPackage.private !== true) {
-    console.warn('warning: the monorepo root is not marked private; `npm publish` at the root would publish the whole repo tarball.');
+  let dir;
+  try {
+    dir = workspaceDir(PACKAGE_NAME);
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 1;
   }
-
-  const order = only ? [only] : publishOrder(openvpn);
-  console.log(`${dryRun ? 'dry-run' : 'publishing'} ${order.length} package(s), tag "${tag}"\n`);
+  const pkg = readJson(path.join(dir, 'package.json'));
+  const entryJs = path.join(dir, 'dist', 'openvpn-sdk', 'src', 'index.js');
+  const entryDts = path.join(dir, 'dist', 'openvpn-sdk', 'src', 'index.d.ts');
 
   const problems = [];
-  for (const name of order) {
-    let dir;
-    try {
-      dir = workspaceDir(name);
-    } catch (err) {
-      problems.push(err instanceof Error ? err.message : String(err));
-      continue;
-    }
-    const pkg = readJson(path.join(dir, 'package.json'));
-    const isPlatformPackage = pkg.name.startsWith('@ovpn-sdk/openvpn-');
-    // Platform packages ship index.js + prebuilt binaries; workspace packages ship dist/.
-    const ready = isPlatformPackage
-      ? existsSync(path.join(dir, 'index.js'))
-      : pkg.main === './dist/index.js' && existsSync(path.join(dir, 'dist', 'index.js'));
-    const label = `${pkg.name}@${pkg.version}`;
-    if (!ready) {
-      problems.push(
-        isPlatformPackage
-          ? `${label}: index.js is missing from ${path.relative(ROOT, dir)}`
-          : `${label}: dist is not ready (main=${pkg.main}). Run: npm run build && node scripts/prepare-release.mjs`,
-      );
-      continue;
-    }
-    const command = ['publish', '--workspace', name, '--access', 'public', '--tag', tag];
-    if (otp) command.push('--otp', otp);
-    if (provenance) command.push('--provenance');
-    if (dryRun) command.push('--dry-run');
+  if (pkg.main !== './dist/openvpn-sdk/src/index.js' || !existsSync(entryJs)) {
+    problems.push('dist is missing or main does not point at it: run `npm run build:single`');
+  }
+  if (!existsSync(entryDts)) {
+    problems.push('dist/openvpn-sdk/src/index.d.ts is missing: run `npm run build:single`');
+  }
+  if (!existsSync(path.join(dir, 'vendor', 'openvpn.json'))) {
+    problems.push('vendor/ is missing: run `npm run build:single`');
+  }
+  if (Object.keys(pkg.dependencies ?? {}).length > 0 || pkg.optionalDependencies) {
+    problems.push('the package still declares dependencies: run `node scripts/prepare-release.mjs` so it is published self-contained');
+  }
+  if (problems.length > 0) {
+    console.error('cannot publish:');
+    for (const problem of problems) console.error(`  - ${problem}`);
+    return 1;
+  }
 
-    console.log(`  ${label}  (${path.relative(ROOT, dir)})`);
-    console.log(`    npm ${command.join(' ')}`);
-    if (dryRun) continue;
+  const command = ['publish', '--workspace', PACKAGE_NAME, '--access', 'public', '--tag', tag];
+  if (otp) command.push('--otp', otp);
+  if (provenance) command.push('--provenance');
+  if (dryRun) command.push('--dry-run');
 
-    // Run through the shell with one command string: passing an args array with
-    // shell:true triggers DEP0190 and is unsafe on Windows.
-    const result = spawnSync(`npm ${command.map(shellQuote).join(' ')}`, {
+  console.log(`${dryRun ? 'dry-run' : 'publishing'}: ${pkg.name}@${pkg.version}, tag "${tag}"`);
+  console.log(`  npm ${command.join(' ')}`);
+  if (dryRun) {
+    // Show what would be packed so a broken tarball is visible before publishing.
+    const packed = spawnSync(`npm pack --workspace ${PACKAGE_NAME} --dry-run --json`, {
       cwd: ROOT,
       shell: true,
       encoding: 'utf8',
       env: process.env,
     });
-    if (result.stdout) process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    if (result.status !== 0) {
-      const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
-      problems.push(`${label}: publish failed (${describeFailure(output)}); retry with --only ${name}`);
-      break;
+    if (packed.status === 0) {
+      try {
+        const [info] = JSON.parse(packed.stdout);
+        console.log(`\n  tarball: ${info.filename} (${info.files.length} files, ${(info.size / 1024 / 1024).toFixed(2)} MiB)`);
+        for (const file of info.files.filter((f) => f.path.startsWith('vendor/') || f.path === 'dist/openvpn-sdk/src/index.js').slice(0, 8)) {
+          console.log(`    ${file.path}`);
+        }
+      } catch {
+        // package manager output changed; the dry-run result is still valid
+      }
     }
+    console.log('\ndry-run complete; re-run with --yes to publish.');
+    return 0;
   }
 
-  if (problems.length > 0) {
-    console.error('\ncannot publish:');
-    for (const problem of problems) console.error(`  - ${problem}`);
-    if (dryRun) console.error('\nrun `npm run build && node scripts/prepare-release.mjs`, then retry.');
+  // Run through the shell with one command string: passing an args array with
+  // shell:true triggers DEP0190 and is unsafe on Windows.
+  const result = spawnSync(`npm ${command.map(shellQuote).join(' ')}`, {
+    cwd: ROOT,
+    shell: true,
+    encoding: 'utf8',
+    env: process.env,
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status !== 0) {
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    console.error(`\ncannot publish: ${PACKAGE_NAME}: ${describeFailure(output)}`);
     return 1;
   }
-
-  console.log(dryRun ? '\ndry-run complete; re-run with --yes to publish.' : '\nall packages published.');
   return 0;
 }
 

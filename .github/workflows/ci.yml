@@ -29,3 +29,5 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+      - name: Build single package
+        run: npm run build:single

@@ -9,9 +9,10 @@ Windows tapctl adapter management, and server-side client-auth decisions.
 npm install openvpn-node-sdk
 ```
 
-The SDK ships a platform package (`@ovpn-sdk/openvpn-<platform>-<arch>`) as an
-optional dependency. On Windows x64 the OpenVPN binaries are bundled; on other
-platforms the resolver falls back to system installs and `PATH`.
+The tarball is self-contained: the JavaScript is compiled into `dist/` (no runtime
+dependencies) and the pinned OpenVPN binaries for Windows x64 are vendored into the
+same package. On other platforms the resolver falls back to a system OpenVPN install
+and `PATH`.
 
 ## Quick start — client
 
@@ -182,21 +183,22 @@ Resolves `openvpn`/`tapctl` in priority order:
 
 1. explicit option (`openvpnBinary`/`tapctlBinary`)
 2. `OPENVPN_BINARY` / `TAPCTL_BINARY` environment variable
-3. bundled platform package (`@ovpn-sdk/openvpn-<platform>-<arch>/bin/...`)
-4. platform install dirs (`Program Files\\OpenVPN\\bin`, Homebrew, `/usr/sbin`, etc.)
-5. `PATH`
+3. bundled `vendor/` directory of the single package (`vendor/openvpn-<platform>-<arch>/bin/...`)
+4. platform package (`@ovpn-sdk/openvpn-<platform>-<arch>`, workspace development only)
+5. platform install dirs (`Program Files\\OpenVPN\\bin`, Homebrew, `/usr/sbin`, etc.)
+6. `PATH`
 
 ```ts
 const mgr = new BinaryManager();
-const openvpn = mgr.resolveOpenVpn();   // { path, source, version? } — version comes from the platform package metadata
+const openvpn = mgr.resolveOpenVpn();   // { path, source, version? } — source is 'bundled' when the packaged binaries are used
 const tapctl = mgr.resolveTapctl();     // Windows only
 const version = await mgr.detectVersion(openvpn.path); // spawns --version; '2.7.5' | null
 await mgr.verifyVersion(openvpn.path, '2.7.5');        // throws unless the binary reports 2.7.5
 ```
 
-`new BinaryManager({ expectedVersion: '2.7.5' })` makes `resolveOpenVpn()` throw when
-the bundled platform package pins a different OpenVPN version; explicit paths and
-`OPENVPN_BINARY` bypass that check.
+`new BinaryManager({ expectedVersion: '2.7.5' })` makes `resolveOpenVpn()` throw when the
+bundled binaries (or the platform package) pin a different OpenVPN version; explicit
+paths and `OPENVPN_BINARY` bypass that check.
 
 Exports: `getPlatformPackageName(platform?, arch?)`, `parseOpenVpnVersion(output)`.
 
@@ -287,31 +289,34 @@ Events on `ManagementClient`: `notify`, `state`, `log`, `bytecount`,
 | `ParsedStatus` | `{ clients: StatusClient[], routes: StatusRoute[], raw }` |
 | `OpenVpnCredentials` | `{ username, password }` |
 
-## Platform packages
+## Bundled OpenVPN binaries
 
-Versions are pinned in [`openvpn-binaries.json`](openvpn-binaries.json)
-(`openvpn.version` + `openvpn.packaging`): a platform package is published as
-`<version>-<packaging>` (e.g. `2.7.5-1`) and carries an `openvpnVersion` field that
-`BinaryManager` reads without spawning anything.
+[`openvpn-binaries.json`](openvpn-binaries.json) is the only place that pins the OpenVPN
+release (`openvpn.version` + `openvpn.packaging`). `scripts/build-single.mjs` copies the
+binaries of every platform whose manifest entry is `vendored` or `release` into
+`vendor/openvpn-<target>/bin/` and records the version in `vendor/openvpn.json`;
+`BinaryManager` reads that file, so the pinned version is known without spawning the
+binary.
 
-| Package | Contents |
-|---|---|
-| `@ovpn-sdk/openvpn-win32-x64` | OpenVPN 2.7.5 — `openvpn.exe`, `tapctl.exe`, runtime DLLs (bundled) |
-| `@ovpn-sdk/openvpn-linux-x64` / `-arm64` | Placeholder; populate with `scripts/fetch-openvpn-binaries.mjs`, or use a system OpenVPN |
-| `@ovpn-sdk/openvpn-darwin-x64` / `-arm64` | Placeholder; populate with the fetch script, or use Homebrew OpenVPN |
+| Target | Contents | Status |
+|---|---|---|
+| `win32-x64` | `openvpn.exe`, `tapctl.exe`, runtime DLLs | vendored in `platform-packages/openvpn-win32-x64/bin` |
+| `linux-x64` / `linux-arm64` | `openvpn` | pending — populate with `scripts/fetch-openvpn-binaries.mjs` |
+| `darwin-x64` / `darwin-arm64` | `openvpn` | pending — populate with the fetch script or use Homebrew |
 
-Only platforms whose manifest entry has real binaries (`source: "vendored"` or
-`"release"`) are listed in `optionalDependencies`, so `npm install` never tries to
-fetch a platform package that does not exist.
+`platform-packages/*` stays in the repository as the staging area for the binaries and
+their metadata, but it is no longer published as separate npm packages: they are baked
+into the single `openvpn-node-sdk` tarball.
 
 ## Development
 
 ```bash
 npm install              # install workspaces
 npm run verify:packages  # check platform packages against openvpn-binaries.json
-npm test                 # node --test (59 tests; real-binary smoke test skipped by default)
+npm test                 # node --test (62 tests; real-binary smoke test skipped by default)
 npm run typecheck        # tsc --noEmit
-npm run build            # compile packages/*/src -> packages/*/dist
+npm run build            # per-package tsc build (packages/*/dist)
+npm run build:single     # bundled single package (dist + vendor) used for publishing
 ```
 
 `npm` is the primary package manager (CI and `package-lock.json`). `pnpm install`
@@ -321,45 +326,30 @@ enables `linkWorkspacePackages`, which pnpm 10+ needs in order to resolve the
 
 ### Publishing
 
-The monorepo root is `private` and must not be published: it has no entry point and
-its tarball is the whole repository. Publish the workspace packages instead, in
-dependency order:
+`openvpn-node-sdk` is published as **one self-contained, unscoped package**: the
+JavaScript of every workspace package is compiled into `dist/` and the pinned binaries
+are vendored, so there are no runtime dependencies and no `@ovpn-sdk/*` packages to
+publish.
 
 ```bash
-npm run build
-node scripts/prepare-release.mjs         # dist entry points + platform os/cpu/version
-npm run publish:packages -- --dry-run    # preview order and versions
-npm run publish:packages -- --yes        # publish (requires `npm login`)
+npm run build:single                    # dist/ (JS + d.ts) and vendor/ binaries
+node scripts/prepare-release.mjs        # main/types -> dist, files: ["dist","vendor"], deps: {}
+npm run publish:packages -- --dry-run   # prints the npm command and the packed file list
+npm run publish:packages -- --yes       # publish (requires `npm login`)
 ```
 
-Order: `@ovpn-sdk/binary` → `@ovpn-sdk/process` → `@ovpn-sdk/core` → `@ovpn-sdk/config`
-→ `@ovpn-sdk/tap` → platform packages that ship binaries → `openvpn-node-sdk`. Every
-package declares `publishConfig.access: "public"`.
-
-Accounts with 2FA mode `auth-and-writes` (`npm profile get`) need a one-time password
-for every publish, or an automation token:
+Accounts with 2FA mode `auth-and-writes` (`npm profile get`) must pass a one-time
+password for the publish:
 
 ```bash
-npm run publish:packages -- --yes --otp 123456        # a fresh code per package
-# once: create an automation token on npmjs.com (Access Tokens), then
-npm config set //registry.npmjs.org:_authToken npm_xxx
-npm run publish:packages -- --yes                     # no OTP needed
+npm run publish:packages -- --yes --otp 123456
 ```
 
-The `@ovpn-sdk` scope must exist before the first scoped publish. npm answers
-`404 Not Found - PUT` when the publishing account does not own the scope (it does not
-say "permission denied"): create a free organization named `ovpn-sdk` on npmjs.com
-(Organizations → Create organization), confirm with `npm org ls ovpn-sdk`, then retry.
-
-Workspace packages publish only `files: ["dist"]`: `dist/` is gitignored, so npm would
-otherwise leave the build output out of the tarball while `main` points at it.
-
-- If a publish fails midway, retry the remaining package with
-  `npm run publish:packages -- --yes --only <name>`.
-- `prepare-release.mjs` rewrites `package.json` (dist paths, `os`/`cpu`); publish from a
-  clean checkout, or revert those edits afterwards
-  (`git checkout -- packages platform-packages`).
-- Only platform packages whose manifest entry is `vendored` or `release` are published.
+- The monorepo root is `private` and must not be published: its tarball is the whole
+  repository and has no entry point.
+- `prepare-release.mjs` rewrites `packages/openvpn-sdk/package.json` into the published
+  shape; restore it afterwards with
+  `git checkout -- packages/openvpn-sdk/package.json`.
 - If the monorepo root was published by mistake, remove it within 72 hours:
   `npm unpublish openvpn-node-sdk-monorepo@<version>`.
 
@@ -370,23 +360,19 @@ OpenVPN release ships. Changing it and re-running the tooling is the whole proce
 
 ```bash
 # 1. bump openvpn.version / openvpn.packaging in openvpn-binaries.json
-# 2. populate a platform package from a release archive or a local unpacked build
-node scripts/fetch-openvpn-binaries.mjs --platform win32-x64 --source ./openvpn-2.7.5-win32-x64.tar.gz
-# 3. verify metadata + binaries
+# 2. populate a platform package from a release archive, URL or local unpacked build
+node scripts/fetch-openvpn-binaries.mjs --platform win32-x64 --source ./openvpn-2.7.6-win32-x64.tar.gz
+# 3. verify the binaries and metadata
 node scripts/verify-platform-packages.mjs             # --no-exec on cross-platform CI
-# 4. preview / apply the release metadata
-node scripts/prepare-release.mjs --dry-run
+# 4. rebuild the single package; vendor/openvpn.json picks up the new version
+npm run build:single
 ```
 
 `fetch-openvpn-binaries.mjs` verifies `sha256` for downloads, runs `<openvpn> --version`
-and refuses to continue unless it matches the manifest. `prepare-release.mjs` derives
-`version` (`<openvpn>-<packaging>`), `openvpnVersion`, `os`/`cpu` and the main package's
-`optionalDependencies` from the manifest, so the source `package.json` files are not
-edited by hand. The runtime override is still `OPENVPN_BINARY`.
-
-`os`/`cpu` are injected at publish time rather than kept in the repo `package.json`:
-npm validates workspace packages against the host platform, so committing them would
-make `npm install` fail with `EBADPLATFORM` when the monorepo is installed on any OS.
+and refuses to continue unless it matches the manifest. `build-single.mjs` then copies
+the pinned binaries into `vendor/` and records the version there, so `BinaryManager`
+reports `source: "bundled"` with the exact version. The runtime override is still
+`OPENVPN_BINARY`.
 
 ### Running the quick start locally (before npm publish)
 
@@ -402,6 +388,9 @@ npm link openvpn-node-sdk
 
 Make sure your test project package.json has `"type": "module"` (the SDK is
 ESM-only). Then `node index.js` from the quick-start examples works.
+
+The published tarball is self-contained, so this local-link workflow is only needed to
+develop against unreleased sources.
 
 With pnpm, do not use a `file:` dependency: pnpm installs the dependencies of
 `file:` links and will fail on the unpublished `@ovpn-sdk/*` packages. Use the
@@ -420,11 +409,11 @@ node scripts/smoke-test.mjs
 RUN_OPENVPN_SMOKE=1 npm test
 ```
 
-Release preparation:
+Release preparation (see "Publishing" above for the full sequence):
 
 ```bash
+npm run build:single
 node scripts/prepare-release.mjs --dry-run
-node scripts/prepare-release.mjs   # points packages at dist/ and applies os/cpu/version metadata from openvpn-binaries.json
 ```
 
 ### Playground (manual end-to-end scenarios)
@@ -449,5 +438,5 @@ full matrix, exit codes and known behaviors.
 
 ## License
 
-SDK packages: MIT. Bundled OpenVPN binaries and platform packages: GPL-2.0-only.
+SDK package: MIT. Bundled OpenVPN binaries: GPL-2.0-only.
 See `LICENSE` and the platform package READMEs.

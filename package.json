@@ -13,6 +13,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:single": "node scripts/build-single.mjs",
     "test": "node --test --test-isolation=none \"packages/**/src/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "playground": "node playground/scripts/mock-flow.mjs",

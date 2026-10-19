@@ -42,10 +42,6 @@ importers:
       '@ovpn-sdk/tap':
         specifier: 0.1.0
         version: link:../tap
-    optionalDependencies:
-      '@ovpn-sdk/openvpn-win32-x64':
-        specifier: 2.7.5-1
-        version: link:../../platform-packages/openvpn-win32-x64
 
   packages/process: {}
 

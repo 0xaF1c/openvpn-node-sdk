@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-export type BinarySource = 'env' | 'explicit' | 'platform-package' | 'install-dir' | 'path';
+export type BinarySource = 'env' | 'explicit' | 'bundled' | 'platform-package' | 'install-dir' | 'path';
 
 export interface ResolvedBinary {
   path: string;
@@ -19,8 +19,10 @@ export interface BinaryManagerOptions {
   tapctlBinary?: string;
   /** Explicit platform package specifier; defaults to @ovpn-sdk/openvpn-<platform>-<arch>. */
   platformPackage?: string;
-  /** Reject a platform package whose `openvpnVersion` differs from this value. */
+  /** Reject a detected version that differs from this value. */
   expectedVersion?: string;
+  /** Directory with the bundled binaries (`vendor/` of the single-package build). */
+  vendorDir?: string;
   /** Injectable resolver (tests); defaults to import.meta.resolve. */
   platformResolver?: (specifier: string) => string | null;
   /** Injectable platform/arch (tests). */
@@ -56,19 +58,42 @@ function defaultPlatformResolver(specifier: string): string | null {
 }
 
 /**
+ * `vendor/` of the single-package build. The compiled binary module lives at
+ * `dist/<pkg>/src/index.js`, so walk up a few levels looking for
+ * `vendor/openvpn.json` instead of assuming one fixed relative path.
+ */
+function defaultVendorDir(): string | null {
+  try {
+    let dir = path.dirname(fileURLToPath(import.meta.url));
+    for (let depth = 0; depth < 4; depth += 1) {
+      const candidate = path.join(dir, 'vendor');
+      if (existsSync(path.join(candidate, 'openvpn.json'))) return candidate;
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolves OpenVPN / tapctl binaries in priority order:
- * explicit option -> environment variable -> bundled platform package ->
- * platform-specific install directories -> PATH.
+ * explicit option -> environment variable -> bundled vendor directory ->
+ * platform package -> platform-specific install directories -> PATH.
  */
 export class BinaryManager {
   private readonly options: BinaryManagerOptions;
   private readonly platformResolver: (specifier: string) => string | null;
+  private readonly vendorDir: string | null;
   private readonly platform: NodeJS.Platform;
   private readonly arch: string;
 
   constructor(options: BinaryManagerOptions = {}) {
     this.options = options;
     this.platformResolver = options.platformResolver ?? defaultPlatformResolver;
+    this.vendorDir = options.vendorDir ?? defaultVendorDir();
     this.platform = options.platform ?? process.platform;
     this.arch = options.arch ?? process.arch;
   }
@@ -135,6 +160,38 @@ export class BinaryManager {
     return resolved;
   }
 
+  /**
+   * Resolve from the `vendor/` directory of the single-package build. The
+   * bundled manifest records the pinned version, so nothing has to be spawned.
+   */
+  private resolveFromVendor(exeName: string): ResolvedBinary | null {
+    if (!this.vendorDir) return null;
+    const metaPath = path.join(this.vendorDir, 'openvpn.json');
+    if (!existsSync(metaPath)) return null;
+
+    let meta: { openvpnVersion?: string; platforms?: Record<string, { version?: string }> } = {};
+    try {
+      meta = JSON.parse(readFileSync(metaPath, 'utf8')) as typeof meta;
+    } catch {
+      return null;
+    }
+
+    const target = `${this.platform}-${this.arch}`;
+    const info = meta.platforms?.[target];
+    if (!info) return null;
+
+    const version = info.version ?? meta.openvpnVersion;
+    if (version && this.options.expectedVersion && version !== this.options.expectedVersion) {
+      throw new Error(`expected OpenVPN ${this.options.expectedVersion}, but the bundled binaries provide ${version}`);
+    }
+
+    const bundled = path.join(this.vendorDir, `openvpn-${target}`, 'bin', exeName);
+    if (!existsSync(bundled)) return null;
+    const resolved: ResolvedBinary = { path: bundled, source: 'bundled' };
+    if (version) resolved.version = version;
+    return resolved;
+  }
+
   private resolve(exeNameWin: string, exeNameOther: string, explicit?: string, envPath?: string): ResolvedBinary {
     const exeName = this.platform === 'win32' ? exeNameWin : exeNameOther;
 
@@ -143,6 +200,11 @@ export class BinaryManager {
     }
     if (envPath && existsSync(envPath)) {
       return { path: envPath, source: 'env' };
+    }
+
+    const fromVendor = this.resolveFromVendor(exeName);
+    if (fromVendor) {
+      return fromVendor;
     }
 
     const platformPackage = this.options.platformPackage ?? getPlatformPackageName(this.platform, this.arch);
