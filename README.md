@@ -348,8 +348,10 @@ npm run publish:packages -- --yes --otp 123456
 - The monorepo root is `private` and must not be published: its tarball is the whole
   repository and has no entry point.
 - `prepare-release.mjs` rewrites `packages/openvpn-sdk/package.json` into the published
-  shape; restore it afterwards with
-  `git checkout -- packages/openvpn-sdk/package.json`.
+  shape and copies `README.md`/`LICENSE` into the package directory (both are
+  gitignored): npm only ships docs that live inside the package directory, so without
+  the copy the npm page shows "No README data found". Restore the manifest afterwards
+  with `git checkout -- packages/openvpn-sdk/package.json`.
 - If the monorepo root was published by mistake, remove it within 72 hours:
   `npm unpublish openvpn-node-sdk-monorepo@<version>`.
 

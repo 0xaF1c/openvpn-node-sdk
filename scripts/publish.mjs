@@ -86,6 +86,11 @@ function main() {
   if (Object.keys(pkg.dependencies ?? {}).length > 0 || pkg.optionalDependencies) {
     problems.push('the package still declares dependencies: run `node scripts/prepare-release.mjs` so it is published self-contained');
   }
+  for (const doc of ['README.md', 'LICENSE']) {
+    if (!existsSync(path.join(dir, doc))) {
+      problems.push(`${doc} is missing from the package (npm shows an empty README): run \`node scripts/prepare-release.mjs\``);
+    }
+  }
   if (problems.length > 0) {
     console.error('cannot publish:');
     for (const problem of problems) console.error(`  - ${problem}`);

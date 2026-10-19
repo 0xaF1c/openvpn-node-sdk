@@ -1,23 +1,25 @@
 {
   "name": "openvpn-node-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "High-level OpenVPN Node.js SDK facade",
   "license": "MIT",
   "type": "module",
-  "main": "./dist/openvpn-sdk/src/index.js",
-  "types": "./dist/openvpn-sdk/src/index.d.ts",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "exports": {
-    ".": {
-      "types": "./dist/openvpn-sdk/src/index.d.ts",
-      "import": "./dist/openvpn-sdk/src/index.js"
-    }
+    ".": "./src/index.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@ovpn-sdk/binary": "0.1.0",
+    "@ovpn-sdk/config": "0.1.0",
+    "@ovpn-sdk/core": "0.1.0",
+    "@ovpn-sdk/process": "0.1.0",
+    "@ovpn-sdk/tap": "0.1.0"
+  },
   "publishConfig": {
     "access": "public"
   },
   "files": [
-    "dist",
-    "vendor"
+    "dist"
   ]
 }
