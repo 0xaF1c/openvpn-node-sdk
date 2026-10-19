@@ -336,6 +336,23 @@ Order: `@ovpn-sdk/binary` → `@ovpn-sdk/process` → `@ovpn-sdk/core` → `@ovp
 → `@ovpn-sdk/tap` → platform packages that ship binaries → `openvpn-node-sdk`. Every
 package declares `publishConfig.access: "public"`.
 
+Accounts with 2FA mode `auth-and-writes` (`npm profile get`) need a one-time password
+for every publish, or an automation token:
+
+```bash
+npm run publish:packages -- --yes --otp 123456        # a fresh code per package
+# once: create an automation token on npmjs.com (Access Tokens), then
+npm config set //registry.npmjs.org:_authToken npm_xxx
+npm run publish:packages -- --yes                     # no OTP needed
+```
+
+The `@ovpn-sdk` scope must exist before the first scoped publish. If npm answers
+`404 Scope not found`, create a free organization named `ovpn-sdk` on npmjs.com
+(Organizations → Create organization) and retry.
+
+Workspace packages publish only `files: ["dist"]`: `dist/` is gitignored, so npm would
+otherwise leave the build output out of the tarball while `main` points at it.
+
 - If a publish fails midway, retry the remaining package with
   `npm run publish:packages -- --yes --only <name>`.
 - `prepare-release.mjs` rewrites `package.json` (dist paths, `os`/`cpu`); publish from a
