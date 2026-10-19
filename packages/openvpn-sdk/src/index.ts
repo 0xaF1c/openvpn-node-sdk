@@ -82,7 +82,6 @@ export class OpenVpnClient extends EventEmitter {
   private current: OvpnState | null = null;
   private readonly stateHistory: OvpnState[] = [];
   private readonly waiters: StateWaiter[] = [];
-  private manuallyDisconnecting = false;
   private createdAdapterGuid: string | null = null;
   private cleanupPromise: Promise<void> | null = null;
 
@@ -110,7 +109,6 @@ export class OpenVpnClient extends EventEmitter {
     if (this.child) {
       throw new Error('OpenVpnClient is already started');
     }
-    this.manuallyDisconnecting = false;
 
     const { path: binary } = this.binaries.resolveOpenVpn();
     const host = this.options.managementHost ?? '127.0.0.1';
@@ -209,7 +207,6 @@ export class OpenVpnClient extends EventEmitter {
 
   async disconnect(): Promise<void> {
     if (!this.child) return;
-    this.manuallyDisconnecting = true;
 
     try {
       if (this.management) {
