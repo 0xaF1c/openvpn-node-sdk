@@ -8,5 +8,8 @@
     "index.js",
     "bin"
   ],
-  "openvpnVersion": "2.7.5"
+  "openvpnVersion": "2.7.5",
+  "publishConfig": {
+    "access": "public"
+  }
 }

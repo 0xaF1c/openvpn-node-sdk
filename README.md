@@ -314,6 +314,37 @@ npm run typecheck        # tsc --noEmit
 npm run build            # compile packages/*/src -> packages/*/dist
 ```
 
+`npm` is the primary package manager (CI and `package-lock.json`). `pnpm install`
+also works: [`pnpm-workspace.yaml`](pnpm-workspace.yaml) declares the workspaces and
+enables `linkWorkspacePackages`, which pnpm 10+ needs in order to resolve the
+`@ovpn-sdk/*` dependencies locally instead of looking them up in the registry.
+
+### Publishing
+
+The monorepo root is `private` and must not be published: it has no entry point and
+its tarball is the whole repository. Publish the workspace packages instead, in
+dependency order:
+
+```bash
+npm run build
+node scripts/prepare-release.mjs         # dist entry points + platform os/cpu/version
+npm run publish:packages -- --dry-run    # preview order and versions
+npm run publish:packages -- --yes        # publish (requires `npm login`)
+```
+
+Order: `@ovpn-sdk/binary` → `@ovpn-sdk/process` → `@ovpn-sdk/core` → `@ovpn-sdk/config`
+→ `@ovpn-sdk/tap` → platform packages that ship binaries → `openvpn-node-sdk`. Every
+package declares `publishConfig.access: "public"`.
+
+- If a publish fails midway, retry the remaining package with
+  `npm run publish:packages -- --yes --only <name>`.
+- `prepare-release.mjs` rewrites `package.json` (dist paths, `os`/`cpu`); publish from a
+  clean checkout, or revert those edits afterwards
+  (`git checkout -- packages platform-packages`).
+- Only platform packages whose manifest entry is `vendored` or `release` are published.
+- If the monorepo root was published by mistake, remove it within 72 hours:
+  `npm unpublish openvpn-node-sdk-monorepo@<version>`.
+
 ### Pinned OpenVPN version
 
 [`openvpn-binaries.json`](openvpn-binaries.json) is the only place that decides which
@@ -353,6 +384,15 @@ npm link openvpn-node-sdk
 
 Make sure your test project package.json has `"type": "module"` (the SDK is
 ESM-only). Then `node index.js` from the quick-start examples works.
+
+With pnpm, do not use a `file:` dependency: pnpm installs the dependencies of
+`file:` links and will fail on the unpublished `@ovpn-sdk/*` packages. Use the
+`link:` protocol instead, which symlinks the package and resolves its dependencies
+from this repository:
+
+```json
+{ "dependencies": { "openvpn-node-sdk": "link:../openvpn/packages/openvpn-sdk" } }
+```
 
 Real-OpenVPN smoke test:
 

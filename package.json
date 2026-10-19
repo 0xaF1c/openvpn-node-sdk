@@ -1,7 +1,7 @@
 {
   "name": "openvpn-node-sdk-monorepo",
   "version": "0.1.1",
-  "private": false,
+  "private": true,
   "description": "OpenVPN Node.js SDK: binary distribution, OpenVPN management interface client, and Windows tapctl adapter management",
   "license": "MIT",
   "engines": {
@@ -25,6 +25,7 @@
     "playground:offline": "node playground/scripts/check.mjs && node playground/scripts/config.mjs && node playground/scripts/mock-flow.mjs",
     "verify:packages": "node scripts/verify-platform-packages.mjs --no-exec",
     "prepare:release": "node scripts/prepare-release.mjs",
+    "publish:packages": "node scripts/publish.mjs",
     "openvpn:fetch": "node scripts/fetch-openvpn-binaries.mjs"
   },
   "devDependencies": {

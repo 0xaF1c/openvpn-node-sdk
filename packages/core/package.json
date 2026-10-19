@@ -11,5 +11,8 @@
   },
   "scripts": {
     "test": "vitest run src"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

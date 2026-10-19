@@ -1,0 +1,12 @@
+# pnpm support for the monorepo.
+#
+# npm remains the primary package manager (package-lock.json, CI uses `npm install`).
+# pnpm users need this file because pnpm 10+ does not link workspace packages that
+# are referenced by a semver range by default: the SDK packages depend on each
+# other by exact version (0.1.0), so without `linkWorkspacePackages` pnpm would
+# try to fetch @ovpn-sdk/* from the registry and fail with 404.
+packages:
+  - packages/*
+  - platform-packages/*
+
+linkWorkspacePackages: true
