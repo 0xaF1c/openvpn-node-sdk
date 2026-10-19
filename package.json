@@ -1,6 +1,6 @@
 {
   "name": "openvpn-node-sdk-monorepo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "description": "OpenVPN Node.js SDK: binary distribution, OpenVPN management interface client, and Windows tapctl adapter management",
   "license": "MIT",
