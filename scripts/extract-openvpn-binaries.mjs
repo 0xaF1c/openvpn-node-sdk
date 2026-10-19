@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 /**
- * Extract OpenVPN binaries from a local OpenVPN installation into the
- * platform package. Defaults target the official Windows install layout:
+ * Legacy helper: copy every .exe/.dll from a local OpenVPN installation into the
+ * platform package bin/ directory. Prefer scripts/fetch-openvpn-binaries.mjs,
+ * which pins the version, checks sha256, validates the file list and runs a
+ * `--version` self check.
+ *
+ * Defaults target the official Windows install layout:
  *
  *   C:\Program Files\OpenVPN\bin  ->  platform-packages/openvpn-win32-x64/bin
  *

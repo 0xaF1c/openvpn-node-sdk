@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -19,6 +19,8 @@ export interface BinaryManagerOptions {
   tapctlBinary?: string;
   /** Explicit platform package specifier; defaults to @ovpn-sdk/openvpn-<platform>-<arch>. */
   platformPackage?: string;
+  /** Reject a platform package whose `openvpnVersion` differs from this value. */
+  expectedVersion?: string;
   /** Injectable resolver (tests); defaults to import.meta.resolve. */
   platformResolver?: (specifier: string) => string | null;
   /** Injectable platform/arch (tests). */
@@ -92,6 +94,47 @@ export class BinaryManager {
     }
   }
 
+  /** Verify that `<binaryPath> --version` reports exactly `expected`. */
+  async verifyVersion(binaryPath: string, expected: string): Promise<string> {
+    const actual = await this.detectVersion(binaryPath);
+    if (actual === null) {
+      throw new Error(`unable to read the OpenVPN version from ${binaryPath}`);
+    }
+    if (actual !== expected) {
+      throw new Error(`expected OpenVPN ${expected} but ${binaryPath} reports ${actual}`);
+    }
+    return actual;
+  }
+
+  /**
+   * Resolve a binary from a platform package, reading `openvpnVersion` from its
+   * package.json so callers get the pinned version without spawning the binary.
+   */
+  private resolveFromPlatformPackage(platformPackage: string, exeName: string): ResolvedBinary | null {
+    const manifestPath = this.platformResolver(`${platformPackage}/package.json`);
+    if (!manifestPath) return null;
+
+    let openvpnVersion: string | undefined;
+    try {
+      const meta = JSON.parse(readFileSync(manifestPath, 'utf8')) as { openvpnVersion?: unknown };
+      openvpnVersion = typeof meta.openvpnVersion === 'string' ? meta.openvpnVersion : undefined;
+    } catch {
+      return null;
+    }
+
+    if (openvpnVersion && this.options.expectedVersion && openvpnVersion !== this.options.expectedVersion) {
+      throw new Error(
+        `expected OpenVPN ${this.options.expectedVersion}, but platform package ${platformPackage} provides ${openvpnVersion}`,
+      );
+    }
+
+    const bundled = path.join(path.dirname(manifestPath), 'bin', exeName);
+    if (!existsSync(bundled)) return null;
+    const resolved: ResolvedBinary = { path: bundled, source: 'platform-package' };
+    if (openvpnVersion) resolved.version = openvpnVersion;
+    return resolved;
+  }
+
   private resolve(exeNameWin: string, exeNameOther: string, explicit?: string, envPath?: string): ResolvedBinary {
     const exeName = this.platform === 'win32' ? exeNameWin : exeNameOther;
 
@@ -103,6 +146,12 @@ export class BinaryManager {
     }
 
     const platformPackage = this.options.platformPackage ?? getPlatformPackageName(this.platform, this.arch);
+    const fromPackage = this.resolveFromPlatformPackage(platformPackage, exeName);
+    if (fromPackage) {
+      return fromPackage;
+    }
+
+    // Legacy fallback: platform packages published before openvpnVersion metadata.
     const bundled = this.platformResolver(`${platformPackage}/bin/${exeName}`);
     if (bundled && existsSync(bundled)) {
       return { path: bundled, source: 'platform-package' };

@@ -188,10 +188,15 @@ Resolves `openvpn`/`tapctl` in priority order:
 
 ```ts
 const mgr = new BinaryManager();
-const openvpn = mgr.resolveOpenVpn();   // ResolvedBinary { path, source }
+const openvpn = mgr.resolveOpenVpn();   // { path, source, version? } — version comes from the platform package metadata
 const tapctl = mgr.resolveTapctl();     // Windows only
-const version = await mgr.detectVersion(openvpn.path); // '2.7.5' | null
+const version = await mgr.detectVersion(openvpn.path); // spawns --version; '2.7.5' | null
+await mgr.verifyVersion(openvpn.path, '2.7.5');        // throws unless the binary reports 2.7.5
 ```
+
+`new BinaryManager({ expectedVersion: '2.7.5' })` makes `resolveOpenVpn()` throw when
+the bundled platform package pins a different OpenVPN version; explicit paths and
+`OPENVPN_BINARY` bypass that check.
 
 Exports: `getPlatformPackageName(platform?, arch?)`, `parseOpenVpnVersion(output)`.
 
@@ -284,21 +289,55 @@ Events on `ManagementClient`: `notify`, `state`, `log`, `bytecount`,
 
 ## Platform packages
 
-| Package | Status |
+Versions are pinned in [`openvpn-binaries.json`](openvpn-binaries.json)
+(`openvpn.version` + `openvpn.packaging`): a platform package is published as
+`<version>-<packaging>` (e.g. `2.7.5-1`) and carries an `openvpnVersion` field that
+`BinaryManager` reads without spawning anything.
+
+| Package | Contents |
 |---|---|
-| `@ovpn-sdk/openvpn-win32-x64` | Populated with OpenVPN 2.7.5 binaries (`openvpn.exe`, `tapctl.exe`, DLLs) |
-| `@ovpn-sdk/openvpn-win32-arm64` | Placeholder |
-| `@ovpn-sdk/openvpn-linux-x64` / `-arm64` | Placeholder (use system OpenVPN or populate `bin/openvpn`) |
-| `@ovpn-sdk/openvpn-darwin-x64` / `-arm64` | Placeholder (use Homebrew OpenVPN or populate `bin/openvpn`) |
+| `@ovpn-sdk/openvpn-win32-x64` | OpenVPN 2.7.5 — `openvpn.exe`, `tapctl.exe`, runtime DLLs (bundled) |
+| `@ovpn-sdk/openvpn-linux-x64` / `-arm64` | Placeholder; populate with `scripts/fetch-openvpn-binaries.mjs`, or use a system OpenVPN |
+| `@ovpn-sdk/openvpn-darwin-x64` / `-arm64` | Placeholder; populate with the fetch script, or use Homebrew OpenVPN |
+
+Only platforms whose manifest entry has real binaries (`source: "vendored"` or
+`"release"`) are listed in `optionalDependencies`, so `npm install` never tries to
+fetch a platform package that does not exist.
 
 ## Development
 
 ```bash
-npm install           # install workspaces
-npm test              # node --test (55 tests; smoke test skipped by default)
-npm run typecheck     # tsc --noEmit
-npm run build         # compile packages/*/src -> packages/*/dist
+npm install              # install workspaces
+npm run verify:packages  # check platform packages against openvpn-binaries.json
+npm test                 # node --test (59 tests; real-binary smoke test skipped by default)
+npm run typecheck        # tsc --noEmit
+npm run build            # compile packages/*/src -> packages/*/dist
 ```
+
+### Pinned OpenVPN version
+
+[`openvpn-binaries.json`](openvpn-binaries.json) is the only place that decides which
+OpenVPN release ships. Changing it and re-running the tooling is the whole procedure:
+
+```bash
+# 1. bump openvpn.version / openvpn.packaging in openvpn-binaries.json
+# 2. populate a platform package from a release archive or a local unpacked build
+node scripts/fetch-openvpn-binaries.mjs --platform win32-x64 --source ./openvpn-2.7.5-win32-x64.tar.gz
+# 3. verify metadata + binaries
+node scripts/verify-platform-packages.mjs             # --no-exec on cross-platform CI
+# 4. preview / apply the release metadata
+node scripts/prepare-release.mjs --dry-run
+```
+
+`fetch-openvpn-binaries.mjs` verifies `sha256` for downloads, runs `<openvpn> --version`
+and refuses to continue unless it matches the manifest. `prepare-release.mjs` derives
+`version` (`<openvpn>-<packaging>`), `openvpnVersion`, `os`/`cpu` and the main package's
+`optionalDependencies` from the manifest, so the source `package.json` files are not
+edited by hand. The runtime override is still `OPENVPN_BINARY`.
+
+`os`/`cpu` are injected at publish time rather than kept in the repo `package.json`:
+npm validates workspace packages against the host platform, so committing them would
+make `npm install` fail with `EBADPLATFORM` when the monorepo is installed on any OS.
 
 ### Running the quick start locally (before npm publish)
 
@@ -327,7 +366,7 @@ Release preparation:
 
 ```bash
 node scripts/prepare-release.mjs --dry-run
-node scripts/prepare-release.mjs   # points packages at dist/, adds os/cpu to platform packages
+node scripts/prepare-release.mjs   # points packages at dist/ and applies os/cpu/version metadata from openvpn-binaries.json
 ```
 
 ### Playground (manual end-to-end scenarios)

@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "openvpn": {
+    "version": "2.7.5",
+    "packaging": 1,
+    "platforms": {
+      "win32-x64": {
+        "os": "win32",
+        "cpu": "x64",
+        "source": "vendored",
+        "archive": null,
+        "url": null,
+        "sha256": null,
+        "files": [
+          "openvpn.exe",
+          "tapctl.exe",
+          "libcrypto-3-x64.dll",
+          "libssl-3-x64.dll",
+          "libpkcs11-helper-1.dll",
+          "libopenvpn_plap.dll",
+          "vcruntime140.dll"
+        ]
+      },
+      "linux-x64": {
+        "os": "linux",
+        "cpu": "x64",
+        "source": "pending",
+        "libc": "glibc",
+        "archive": null,
+        "url": null,
+        "sha256": null,
+        "files": [
+          "openvpn"
+        ]
+      },
+      "linux-arm64": {
+        "os": "linux",
+        "cpu": "arm64",
+        "source": "pending",
+        "libc": "glibc",
+        "archive": null,
+        "url": null,
+        "sha256": null,
+        "files": [
+          "openvpn"
+        ]
+      },
+      "darwin-x64": {
+        "os": "darwin",
+        "cpu": "x64",
+        "source": "pending",
+        "archive": null,
+        "url": null,
+        "sha256": null,
+        "files": [
+          "openvpn"
+        ]
+      },
+      "darwin-arm64": {
+        "os": "darwin",
+        "cpu": "arm64",
+        "source": "pending",
+        "archive": null,
+        "url": null,
+        "sha256": null,
+        "files": [
+          "openvpn"
+        ]
+      }
+    }
+  }
+}

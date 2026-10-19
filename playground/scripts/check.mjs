@@ -104,9 +104,9 @@ async function main() {
     reporter.ok(`openvpn resolved via ${report.openvpn.source}`);
     reporter.info(`          ${report.openvpn.path}`);
     if (report.version) {
-      reporter.ok(`openvpn --version reported ${report.version}`);
+      reporter.ok(`openvpn version ${report.version} (from ${report.versionSource})`);
     } else {
-      reporter.warn('openvpn version unknown (spawning with captured stdout is blocked in confined sandboxes)');
+      reporter.warn('openvpn version unknown (no platform package metadata and --version could not be read)');
     }
   }
   if (process.platform === 'win32') {

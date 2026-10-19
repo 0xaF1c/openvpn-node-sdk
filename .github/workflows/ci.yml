@@ -21,6 +21,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Verify platform packages
+        run: npm run verify:packages
       - name: Typecheck
         run: npm run typecheck
       - name: Test

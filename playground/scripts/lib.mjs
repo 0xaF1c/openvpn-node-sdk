@@ -305,15 +305,21 @@ export function createFakeAdapterManager(adapter = { guid: '{fake-adapter-guid}'
 
 /**
  * Resolve the OpenVPN/tapctl binaries without throwing, and report the source
- * and version. `detectVersion` returning null is expected in confined sandboxes
- * (capturing a child's piped stdout is blocked there), so it is only a warning.
+ * and version. The version comes from the platform package metadata when it is
+ * available, so confined sandboxes that block spawning piped stdio still see it.
  */
 export async function resolveBinaries(BinaryManager, { tapctl = false } = {}) {
-  const report = { openvpn: null, tapctl: null, errors: [] };
+  const report = { openvpn: null, tapctl: null, errors: [], version: null, versionSource: null };
   try {
     const mgr = new BinaryManager();
     report.openvpn = mgr.resolveOpenVpn();
-    report.version = await mgr.detectVersion(report.openvpn.path);
+    if (report.openvpn.version) {
+      report.version = report.openvpn.version;
+      report.versionSource = 'platform-package metadata';
+    } else {
+      report.version = await mgr.detectVersion(report.openvpn.path);
+      report.versionSource = report.version ? 'openvpn --version' : null;
+    }
     if (tapctl && process.platform === 'win32') {
       try {
         report.tapctl = mgr.resolveTapctl();

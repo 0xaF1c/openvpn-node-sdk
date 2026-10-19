@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { BinaryManager, getPlatformPackageName, parseOpenVpnVersion } from '../index.ts';
@@ -60,10 +60,82 @@ describe('BinaryManager resolution order', () => {
       t.skip('platform package binaries are populated on Windows only in this repo');
       return;
     }
-    // Integration check: the extraction script has populated the platform package.
+    // Integration check: scripts/fetch-openvpn-binaries.mjs has populated the platform package.
     const mgr = new BinaryManager();
     const openvpn = mgr.resolveOpenVpn();
     assert.ok(openvpn.path.length > 0);
     assert.ok(openvpn.source === 'platform-package' || openvpn.source === 'install-dir' || openvpn.source === 'path');
+    if (openvpn.source === 'platform-package') {
+      assert.match(openvpn.version ?? '', /^\d+\.\d+\.\d+$/, 'platform package metadata should carry the pinned OpenVPN version');
+    }
+  });
+});
+
+describe('platform package metadata', () => {
+  async function makePlatformPackage(openvpnVersion: string) {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-pkg-meta-'));
+    const pkgDir = path.join(dir, 'node_modules', '@ovpn-sdk', 'openvpn-win32-x64');
+    await mkdir(path.join(pkgDir, 'bin'), { recursive: true });
+    await writeFile(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: '@ovpn-sdk/openvpn-win32-x64', version: '2.7.5-1', openvpnVersion }),
+      'utf8',
+    );
+    const binary = path.join(pkgDir, 'bin', 'openvpn.exe');
+    await writeFile(binary, '');
+    const resolver = (specifier: string) =>
+      specifier.endsWith('/package.json') ? path.join(pkgDir, 'package.json') : null;
+    return { dir, binary, resolver };
+  }
+
+  it('reads openvpnVersion from the platform package without spawning it', async () => {
+    const { dir, binary, resolver } = await makePlatformPackage('2.7.5');
+    const mgr = new BinaryManager({ platformResolver: resolver });
+    assert.deepEqual(mgr.resolveOpenVpn(), { path: binary, source: 'platform-package', version: '2.7.5' });
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('rejects a platform package that does not satisfy expectedVersion', async () => {
+    const { dir, resolver } = await makePlatformPackage('2.6.12');
+    const mismatch = new BinaryManager({ platformResolver: resolver, expectedVersion: '2.7.5' });
+    assert.throws(
+      () => mismatch.resolveOpenVpn(),
+      /expected OpenVPN 2\.7\.5, but platform package @ovpn-sdk\/openvpn-win32-x64 provides 2\.6\.12/,
+    );
+
+    const match = new BinaryManager({ platformResolver: resolver, expectedVersion: '2.6.12' });
+    assert.equal(match.resolveOpenVpn().version, '2.6.12');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('falls through when the platform package has metadata but no binary', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-pkg-empty-'));
+    const pkgDir = path.join(dir, 'node_modules', '@ovpn-sdk', 'openvpn-win32-x64');
+    await mkdir(pkgDir, { recursive: true });
+    await writeFile(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: '@ovpn-sdk/openvpn-win32-x64', openvpnVersion: '2.7.5' }),
+      'utf8',
+    );
+    const resolver = (specifier: string) =>
+      specifier.endsWith('/package.json') ? path.join(pkgDir, 'package.json') : null;
+    const mgr = new BinaryManager({ platformResolver: resolver });
+
+    let resolved: ReturnType<BinaryManager['resolveOpenVpn']> | null = null;
+    try {
+      resolved = mgr.resolveOpenVpn();
+    } catch {
+      resolved = null;
+    }
+    assert.ok(resolved === null || resolved.source !== 'platform-package');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('verifyVersion rejects binaries whose OpenVPN version cannot be read', async () => {
+    const mgr = new BinaryManager();
+    await assert.rejects(
+      () => mgr.verifyVersion(process.execPath, '2.7.5'),
+      /unable to read the OpenVPN version|expected OpenVPN 2\.7\.5/,
+    );
   });
 });

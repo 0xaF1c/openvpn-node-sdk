@@ -22,7 +22,10 @@
     "playground:smoke": "node playground/scripts/smoke.mjs",
     "playground:connect": "node playground/scripts/connect.mjs",
     "playground:adapters": "node playground/scripts/adapters.mjs",
-    "playground:offline": "node playground/scripts/check.mjs && node playground/scripts/config.mjs && node playground/scripts/mock-flow.mjs"
+    "playground:offline": "node playground/scripts/check.mjs && node playground/scripts/config.mjs && node playground/scripts/mock-flow.mjs",
+    "verify:packages": "node scripts/verify-platform-packages.mjs --no-exec",
+    "prepare:release": "node scripts/prepare-release.mjs",
+    "openvpn:fetch": "node scripts/fetch-openvpn-binaries.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
