@@ -38,6 +38,44 @@ export interface ProcessManagerLike {
   getStdout?(): string;
 }
 
+const BACKSLASH = String.fromCharCode(92);
+
+/**
+ * Quote one argument for a Windows command line as parsed by
+ * `CommandLineToArgvW` (the same rules the OpenVPN interactive service uses
+ * when it validates and forwards `--options`).
+ *
+ * Backslashes are only doubled when they precede a double quote or the
+ * closing quote; otherwise they are literal path separators.
+ */
+export function quoteWindowsCommandLineArg(arg: string): string {
+  if (arg === '') return '""';
+  if (!/[ \t\n\v\r"]/.test(arg)) return arg;
+
+  let out = '"';
+  let backslashes = 0;
+  for (const ch of arg) {
+    if (ch === BACKSLASH) {
+      backslashes += 1;
+      continue;
+    }
+    if (ch === '"') {
+      out += BACKSLASH.repeat(backslashes * 2 + 1) + '"';
+      backslashes = 0;
+      continue;
+    }
+    out += BACKSLASH.repeat(backslashes) + ch;
+    backslashes = 0;
+  }
+  out += BACKSLASH.repeat(backslashes * 2) + '"';
+  return out;
+}
+
+/** Join argv into a single Windows command-line string (without argv[0]). */
+export function buildWindowsCommandLine(args: string[]): string {
+  return args.map(quoteWindowsCommandLineArg).join(' ');
+}
+
 /** Build the argv for launching an OpenVPN client with a management socket. */
 export function buildOpenVpnArgs(options: OpenVpnProcessOptions): string[] {
   const managementArgs = options.managementSocket

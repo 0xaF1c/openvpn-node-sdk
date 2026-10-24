@@ -82,7 +82,7 @@ describe('AdapterManager with injected exec', () => {
       { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: wide('{new}' + TAB + 'created' + TAB + 'ovpn-dco' + NL), stderr: Buffer.alloc(0), exitCode: 0 } },
       { args: ['delete', '{new}'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } },
     ]);
-    const mgr = new AdapterManager({ exec });
+    const mgr = new AdapterManager({ exec, serviceMode: 'never' });
     const adapter = await mgr.ensure({ hwid: 'ovpn-dco' });
     assert.equal(adapter?.guid, '{new}');
     await mgr.release('{new}');
@@ -119,16 +119,97 @@ describe('AdapterManager with injected exec', () => {
     assert.deepEqual(serviceClient.calls, [0]);
   });
 
+  it('uses the interactive service directly when serviceMode is always', async () => {
+    const { exec, calls } = fakeExec([
+      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } },
+    ]);
+    const service = {
+      available: true,
+      calls: [] as number[],
+      async isAvailable() {
+        return this.available;
+      },
+      async createAdapter(adapterType: number) {
+        this.calls.push(adapterType);
+        return 0;
+      },
+    };
+    const mgr = new AdapterManager({ exec, serviceClient: service, serviceMode: 'always' });
+    const adapter = await mgr.ensure({ hwid: 'ovpn-dco' });
+    assert.equal(adapter?.viaService, true);
+    assert.deepEqual(service.calls, [0]);
+    assert.equal(calls.some((c) => c[0] === 'create'), false);
+  });
+
+  it('create falls back to the service on elevation error', async () => {
+    const { exec } = fakeExec([
+      { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
+    ]);
+    const service = {
+      async createAdapter() {
+        return 0;
+      },
+    };
+    const mgr = new AdapterManager({ exec, serviceClient: service });
+    const adapter = await mgr.create({ hwid: 'ovpn-dco' });
+    assert.equal(adapter.viaService, true);
+    assert.equal(adapter.name, '');
+  });
+
+  it('tries the next driver when a service create fails', async () => {
+    const { exec } = fakeExec([
+      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } },
+    ]);
+    const service = {
+      calls: [] as number[],
+      async isAvailable() {
+        return true;
+      },
+      async createAdapter(adapterType: number) {
+        this.calls.push(adapterType);
+        return adapterType === 0 ? 1 : 0;
+      },
+    };
+    const mgr = new AdapterManager({ exec, serviceClient: service, serviceMode: 'always' });
+    const adapter = await mgr.ensure();
+    assert.equal(adapter?.hwid, ROOT_TAP);
+    assert.deepEqual(service.calls, [0, 1]);
+  });
+
+  it('does not call the service when serviceMode is never', async () => {
+    const { exec } = fakeExec([
+      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
+      { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
+    ]);
+    const service = {
+      called: false,
+      async createAdapter() {
+        this.called = true;
+        return 0;
+      },
+    };
+    const mgr = new AdapterManager({ exec, serviceClient: service, serviceMode: 'never' });
+    await assert.rejects(() => mgr.ensure({ hwid: 'ovpn-dco' }), /unable to create a TAP adapter/);
+    assert.equal(service.called, false);
+  });
+
+  it('ignores empty adapter release keys', async () => {
+    const { exec, calls } = fakeExec([]);
+    const mgr = new AdapterManager({ exec, serviceMode: 'never' });
+    await mgr.release('');
+    assert.equal(calls.length, 0);
+  });
+
   it('surfaces reboot-required and win32 codes via TapctlError', async () => {
     const { exec } = fakeExec([
-      { args: ['create', '--hwid', 'tap0901'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL + 'A system reboot is required.' + NL), exitCode: 1 } },
+      { args: ['create', '--hwid', 'tap0901'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x20' + NL + 'A system reboot is required.' + NL), exitCode: 1 } },
     ]);
-    const mgr = new AdapterManager({ exec });
+    const mgr = new AdapterManager({ exec, serviceMode: 'never' });
     await assert.rejects(
       () => mgr.create({ hwid: 'tap0901' }),
       (err: unknown) => {
         assert.ok(err instanceof TapctlError);
-        assert.equal(err.win32Code, 0x2e4);
+        assert.equal(err.win32Code, 0x20);
         assert.equal(err.rebootRequired, true);
         return true;
       },

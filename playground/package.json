@@ -11,6 +11,7 @@
     "smoke": "node scripts/smoke.mjs",
     "connect": "node scripts/connect.mjs",
     "adapters": "node scripts/adapters.mjs",
+    "service": "node scripts/service.mjs",
     "offline": "node scripts/check.mjs && node scripts/config.mjs && node scripts/mock-flow.mjs"
   }
 }

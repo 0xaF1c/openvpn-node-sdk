@@ -3,8 +3,17 @@ import { EventEmitter } from 'node:events';
 import { describe, it } from 'node:test';
 import { MockManagementServer } from '@ovpn-sdk/core';
 import { type ProcessManagerLike, type SpawnedProcess } from '@ovpn-sdk/process';
-import { readFile } from 'node:fs/promises';
-import { OpenVpnClient, OpenVpnServer, OvpnConfig } from '../index.ts';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import {
+  OpenVpnClient,
+  OpenVpnServer,
+  OvpnConfig,
+  type OpenvpnServiceClientLike,
+  type OpenvpnStartOptions,
+  type ServiceOpenVpnProcessLike,
+} from '../index.ts';
 
 class FakeProcess extends EventEmitter implements SpawnedProcess {
   pid = 12345;
@@ -32,6 +41,10 @@ class FakeAdapterManager {
   async release(guidOrName: string): Promise<void> {
     this.released.push(guidOrName);
   }
+
+  async isElevated(): Promise<boolean> {
+    return false;
+  }
 }
 
 class FakeProcessManager implements ProcessManagerLike {
@@ -47,6 +60,52 @@ class FakeProcessManager implements ProcessManagerLike {
   async killTree(pid: number): Promise<void> {
     this.killTreeCalls.push(pid);
     this.child.kill('SIGKILL');
+  }
+}
+
+class FakeServiceProcess extends EventEmitter implements ServiceOpenVpnProcessLike {
+  readonly pid: number;
+  exitCode: number | null = null;
+  lastError = '';
+
+  constructor(pid = 4242) {
+    super();
+    this.pid = pid;
+  }
+
+  kill(): boolean {
+    if (this.exitCode !== null) return false;
+    this.exitCode = 0;
+    this.emit('exit', 0, null);
+    return true;
+  }
+
+  close(): void {
+    if (this.exitCode === null) {
+      this.exitCode = 0;
+      this.emit('exit', 0, null);
+    }
+  }
+}
+
+class FakeServiceClient implements OpenvpnServiceClientLike {
+  available = true;
+  readonly started: OpenvpnStartOptions[] = [];
+  readonly adapterTypes: number[] = [];
+  readonly process = new FakeServiceProcess();
+
+  async isAvailable(): Promise<boolean> {
+    return this.available;
+  }
+
+  async createAdapter(adapterType: number): Promise<number> {
+    this.adapterTypes.push(adapterType);
+    return 0;
+  }
+
+  async startOpenVpn(options: OpenvpnStartOptions): Promise<ServiceOpenVpnProcessLike> {
+    this.started.push(options);
+    return this.process;
   }
 }
 
@@ -71,6 +130,7 @@ describe('OpenVpnClient orchestration', () => {
         managementHost: '127.0.0.1',
         managementPort: port,
         disconnectTimeoutMs: 300,
+        elevation: 'never',
         credentials: () => credentials,
       },
     );
@@ -118,6 +178,139 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
+  it('automatically chooses openvpnserv for a non-elevated process', async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const service = new FakeServiceClient();
+    const fakeAdapters = new FakeAdapterManager();
+
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      managementHost: '127.0.0.1',
+      managementPort: port,
+      disconnectTimeoutMs: 20,
+      manageAdapter: false,
+      serviceClient: service,
+    });
+
+    await client.connect();
+    assert.equal(fakeManager.started.length, 0);
+    assert.equal(service.started.length, 1);
+    await client.disconnect();
+    await server.stop();
+  });
+
+  it('cleans up when the service process exits before disconnect', async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const service = new FakeServiceClient();
+    const fakeAdapters = new FakeAdapterManager();
+
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      managementHost: '127.0.0.1',
+      managementPort: port,
+      elevation: 'service',
+      serviceClient: service,
+    });
+
+    await client.connect();
+    service.process.close(); // simulate OpenVPN exiting on its own
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await client.disconnect();
+
+    assert.equal(client.currentState, null);
+    assert.deepEqual(fakeAdapters.released, ['{adapter-guid}']);
+    await server.stop();
+  });
+
+  it('writes and cleans the profile in serviceConfigDir', async () => {
+    const configDir = await mkdtemp(path.join(tmpdir(), 'ovpn-sdk-test-'));
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const service = new FakeServiceClient();
+    const fakeAdapters = new FakeAdapterManager();
+
+    try {
+      const client = new OpenVpnClient('dev null\n', {
+        binary: process.execPath,
+        processManager: fakeManager,
+        adapterManager: fakeAdapters,
+        managementHost: '127.0.0.1',
+        managementPort: port,
+        disconnectTimeoutMs: 20,
+        elevation: 'service',
+        serviceClient: service,
+        serviceConfigDir: configDir,
+      });
+
+      await client.connect();
+      const start = service.started[0];
+      assert.ok(start);
+      const match = start.options.match(/--config ("[^"]+"|\S+)/);
+      const configPath = (match?.[1] ?? '').replace(/^"|"$/g, '');
+      assert.ok(configPath.startsWith(configDir), start.options);
+      assert.deepEqual(await readdir(configDir), [path.basename(configPath)]);
+
+      await client.disconnect();
+      assert.deepEqual(await readdir(configDir), []);
+    } finally {
+      await rm(configDir, { recursive: true, force: true });
+      await server.stop();
+    }
+  });
+
+  it('launches through openvpnserv when elevation is required', async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const service = new FakeServiceClient();
+    const fakeAdapters = new FakeAdapterManager();
+
+    const client = new OpenVpnClient(
+      new OvpnConfig().client().remote('vpn.example.com', 1194, 'udp').dev('tun'),
+      {
+        binary: process.execPath,
+        processManager: fakeManager,
+        adapterManager: fakeAdapters,
+        managementHost: '127.0.0.1',
+        managementPort: port,
+        disconnectTimeoutMs: 20,
+        elevation: 'service',
+        serviceClient: service,
+      },
+    );
+
+    await client.connect();
+
+    // No direct spawn: the service owns the OpenVPN process.
+    assert.equal(fakeManager.started.length, 0);
+    assert.equal(service.started.length, 1);
+    const start = service.started[0];
+    assert.ok(start);
+    assert.ok(start.workingDirectory.length > 0);
+    assert.match(start.options, /--config/);
+    assert.match(start.options, /--management 127\.0\.0\.1 /);
+    assert.match(start.options, /--log/);
+
+    const configMatch = start.options.match(/--config ("[^"]+"|\S+)/);
+    assert.ok(configMatch);
+    const configPath = (configMatch[1] ?? '').replace(/^"|"$/g, '');
+    const configText = await readFile(configPath, 'utf8');
+    assert.ok(configText.includes('dev-node "SDK TAP Adapter"'), configText);
+
+    await client.disconnect();
+    assert.deepEqual(fakeAdapters.released, ['{adapter-guid}']);
+    await server.stop();
+  });
+
   it('waitFor resolves immediately when already in the target state', async () => {
     const server = new MockManagementServer();
     const port = await server.start();
@@ -128,6 +321,7 @@ describe('OpenVpnClient orchestration', () => {
       managementPort: port,
       disconnectTimeoutMs: 300,
       manageAdapter: false,
+      elevation: 'never',
     });
     await client.connect();
     server.broadcast('>STATE:1715000000,CONNECTED,init,,,,,,,');
