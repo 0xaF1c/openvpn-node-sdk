@@ -47,6 +47,66 @@ whoami /groups            # look for "Mandatory Label\High Mandatory Level"
 where powershell.exe
 ```
 
+## Branding the UAC prompt
+
+Windows owns the consent dialog: its title ("User Account Control") and body
+text cannot be changed. What you *can* control is the program identity —
+**icon**, **program name** (`FileDescription`), **product name** and
+**publisher** (Authenticode signer) — all taken from the executable that is
+elevated. By default the SDK elevates `node.exe`, so the prompt says
+"Node.js" with the Node.js icon.
+
+Build a small branded launcher and point the SDK at it:
+
+```powershell
+# Requires .NET Framework 4.x (csc.exe). Icon and signing are optional.
+.\scripts\build-elevate-launcher.ps1 `
+  -Title 'Acme VPN' -Product 'Acme VPN' -Company 'Acme Inc.' `
+  -Icon .\assets\acme.ico -OutFile .\build\AcmeElevate.exe
+
+# Recommended: sign it so UAC shows "Verified publisher: Acme Inc."
+signtool sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 .\build\AcmeElevate.exe
+```
+
+```ts
+const vpn = new OpenVpnClient(config, {
+  elevation: 'auto',
+  elevateLauncher: 'C:\\build\\AcmeElevate.exe',
+});
+```
+
+The generated launcher is a generic "run this elevated" wrapper: it receives
+`<nodePath> <helperPath> --port … --token …` and runs Node.js with the
+remaining arguments. Unsigned launchers show **Unknown publisher** with a
+yellow UAC shield; sign them in CI with your code-signing certificate to get a
+verified publisher.
+
+What cannot be customised: the dialog title, the "Do you want to allow this app
+to make changes to your device?" text and the shield icon are rendered by
+Windows. A pre-UAC splash/confirmation is an application concern; this SDK does
+not add one.
+
+## Other platforms
+
+UAC is Windows-only; the SDK never tries to elevate on Linux/macOS.
+
+| Platform | `isElevated()` | `elevation: 'auto'` | `elevation: 'always'` |
+|---|---|---|---|
+| Windows | `net session` succeeds | starts the UAC helper when not elevated | always uses the helper |
+| Linux/macOS | uid 0 | spawns directly | throws `ElevationUnavailableError` |
+| other | `true` | spawns directly | throws |
+
+- On POSIX the SDK does **not** use `sudo`/`pkexec`: neither can preserve the
+  child-process/stdio contract without a TTY or a polkit policy. Run the
+  Node.js process as root (systemd unit, container, `sudo node …`) when OpenVPN
+  needs to create a tun device or change routes.
+- Adapter management is Windows-only (`tapctl.exe`); on POSIX OpenVPN creates
+  the tun/tap device itself.
+- `elevateLauncher` / `ElevatedBroker` are Windows-only. Pass a custom
+  `broker` (`ElevatedBrokerLike`) if you need a different privilege mechanism.
+- The management interface is platform-neutral: TCP, or a unix socket via
+  `managementSocketPath`.
+
 ## API
 
 ```ts
@@ -96,8 +156,8 @@ try {
 ```
 
 `ElevatedBroker` options: `handshakeTimeoutMs` (default 120 s),
-`commandTimeoutMs` (default 30 s), `helperPath`, `nodePath`, and `launch`
-(injectable launcher, used by tests).
+`commandTimeoutMs` (default 30 s), `helperPath`, `nodePath`, `launcherPath`,
+and `launch` (injectable launcher, used by tests).
 
 ## Adapter creation
 
@@ -133,6 +193,8 @@ when needed.
 | `ElevationUnavailableError` "PowerShell ... not found" | `powershell.exe` is not available | Use a normal Windows installation, or run the process elevated with `elevation: 'never'`. |
 | "the elevated helper did not connect back within 120000ms" | The UAC prompt stayed open too long, or the helper crashed | Approve the prompt promptly; check that `node` can start `elevate-helper.js`. |
 | No prompt appears at all | The process is already elevated, or `elevation: 'never'` | Check `whoami /groups`; see the `elevation` modes above. |
+| UAC shows "Node.js" and the Node icon | The elevated executable is `node.exe` | Build a branded launcher and set `elevateLauncher` (see "Branding the UAC prompt"). |
+| UAC shows "Unknown publisher" | The launcher is not Authenticode-signed | Sign the launcher with `signtool` in CI. |
 | `connect()` from a service fails | Session 0 has no interactive desktop | Run the service as LocalSystem and use `elevation: 'never'`. |
 | Adapter creation still fails with 740 | The elevated runner was not wired (standalone `AdapterManager`) | Pass `elevatedExec: (file, args) => broker.run(file, args)`. |
 

@@ -2,8 +2,9 @@
 /**
  * Scenario: report the Windows UAC elevation setup used by the SDK.
  *
- *   npm run playground:elevate            # report only (no UAC prompt)
- *   npm run playground:elevate -- --test  # prompt for UAC and run `whoami /groups`
+ *   npm run playground:elevate                        # report only (no UAC prompt)
+ *   npm run playground:elevate -- --test              # prompt for UAC and run `whoami /groups`
+ *   npm run playground:elevate -- --launcher <path>   # report/use a branded launcher
  *
  * The helper is only started on demand, so the report itself never prompts.
  * Non-Windows hosts exit with code 2.
@@ -11,9 +12,11 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { ElevatedBroker, ElevationError, isElevated } from 'openvpn-node-sdk';
-import { bold, dim, EXIT_FAIL, EXIT_SKIP, Reporter } from './lib.mjs';
+import { bold, dim, EXIT_FAIL, EXIT_SKIP, parseArgs, Reporter } from './lib.mjs';
 
+const cli = parseArgs();
 const args = process.argv.slice(2);
+const launcherPath = cli.get('launcher');
 const reporter = new Reporter('playground:elevate');
 
 function describeError(err) {
@@ -40,11 +43,20 @@ async function main() {
   }
 
   reporter.section('helper');
-  const broker = new ElevatedBroker();
+  const broker = new ElevatedBroker(
+    launcherPath === undefined ? {} : { launcherPath: path.resolve(launcherPath) },
+  );
   reporter.info(`helper script: ${broker.helperPath}`);
   reporter.expect(existsSync(broker.helperPath), 'elevation helper is present');
   reporter.info(`node for the helper: ${broker.nodePath}`);
-  reporter.info(dim('launcher: powershell Start-Process -Verb RunAs (UAC)'));
+  if (broker.launcherPath === undefined) {
+    reporter.info(dim('launcher: powershell Start-Process -Verb RunAs → node.exe (UAC shows "Node.js")'));
+    reporter.info(dim('brand it with: npm run playground:elevate -- --launcher <your-launcher.exe>'));
+  } else {
+    reporter.info(`launcher: ${broker.launcherPath}`);
+    reporter.expect(existsSync(broker.launcherPath), 'branded launcher is present');
+    reporter.info(dim('the UAC prompt shows the launcher icon/name/publisher'));
+  }
 
   if (!args.includes('--test')) {
     reporter.section('next');

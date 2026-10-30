@@ -34,10 +34,31 @@ describe('ManagementClient', () => {
     await initialized;
 
     assert.equal(client.protocolVersion, 6);
+    assert.equal(client.serverManagementVersion, 6);
     assert.ok(client.welcomeLine.includes('OpenVPN Management Interface Version 6'));
     assert.ok(server.received.includes('version 6'));
     assert.ok(server.received.includes('state on all'));
     assert.ok(server.received.includes('log on all'));
+    assert.ok(server.received.includes('bytecount 1'));
+
+    await client.disconnect();
+    await server.stop();
+  });
+
+  it('skips version negotiation on OpenVPN 2.6 (management version 5)', async () => {
+    // OpenVPN 2.6 advertises protocol 5 and does not acknowledge `version 6`,
+    // so waiting for a reply would time out; the init sequence must skip it.
+    const server = new MockManagementServer({
+      welcome: ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info",
+    });
+    const port = await server.start();
+    const client = new ManagementClient({ host: '127.0.0.1', port, autoReconnect: false });
+
+    await client.connect();
+
+    assert.equal(client.serverManagementVersion, 5);
+    assert.equal(server.received.includes('version 6'), false);
+    assert.ok(server.received.includes('state on all'));
     assert.ok(server.received.includes('bytecount 1'));
 
     await client.disconnect();

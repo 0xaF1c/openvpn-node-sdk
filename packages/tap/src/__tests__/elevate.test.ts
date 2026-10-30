@@ -5,6 +5,9 @@ import {
   ElevatedBroker,
   ElevationCancelledError,
   ElevationError,
+  ElevationUnavailableError,
+  buildElevatedLaunchCommand,
+  isElevated,
   type ElevatedLaunchOptions,
 } from '../elevate.ts';
 
@@ -85,6 +88,63 @@ function destroyAll(helper: FakeHelper): void {
   for (const socket of helper.sockets) socket.destroy();
 }
 
+describe('buildElevatedLaunchCommand', () => {
+  it('elevates node with the helper arguments by default', () => {
+    const command = buildElevatedLaunchCommand({
+      nodePath: 'C:\\Program Files\\nodejs\\node.exe',
+      helperPath: 'C:\\sdk\\elevate-helper.js',
+      port: 4321,
+      token: 'abc123',
+    });
+    assert.equal(command.targetFile, 'C:\\Program Files\\nodejs\\node.exe');
+    assert.equal(command.targetArguments, String.raw`C:\sdk\elevate-helper.js --port 4321 --token abc123`);
+    assert.ok(command.powerShellScript.includes(String.raw`Start-Process -FilePath 'C:\Program Files\nodejs\node.exe'`));
+    assert.match(command.powerShellScript, /-Verb RunAs/);
+  });
+
+  it('elevates a branded launcher and forwards node + helper paths', () => {
+    const command = buildElevatedLaunchCommand({
+      nodePath: 'C:\\node\\node.exe',
+      helperPath: 'C:\\sdk\\elevate-helper.js',
+      port: 1,
+      token: 't',
+      launcherPath: 'C:\\Brand\\AcmeElevate.exe',
+    });
+    assert.equal(command.targetFile, 'C:\\Brand\\AcmeElevate.exe');
+    assert.equal(
+      command.targetArguments,
+      String.raw`C:\node\node.exe C:\sdk\elevate-helper.js --port 1 --token t`,
+    );
+    assert.ok(command.powerShellScript.includes(String.raw`FilePath 'C:\Brand\AcmeElevate.exe'`));
+  });
+
+  it('quotes paths with spaces', () => {
+    const command = buildElevatedLaunchCommand({
+      nodePath: 'C:\\Program Files\\nodejs\\node.exe',
+      helperPath: 'C:\\Program Files\\SDK\\elevate-helper.js',
+      port: 2,
+      token: 'x',
+    });
+    assert.equal(
+      command.targetArguments,
+      String.raw`"C:\Program Files\SDK\elevate-helper.js" --port 2 --token x`,
+    );
+  });
+});
+
+describe('isElevated', { skip: process.platform === 'win32' && 'Windows uses the net session probe' }, () => {
+  it('reflects the effective uid on POSIX', async () => {
+    assert.equal(await isElevated(), process.getuid?.() === 0);
+  });
+});
+
+describe('Default launcher', { skip: process.platform === 'win32' && 'Windows uses PowerShell/UAC' }, () => {
+  it('reports UAC as unavailable off Windows', async () => {
+    const broker = new ElevatedBroker({ handshakeTimeoutMs: 200 });
+    await assert.rejects(() => broker.run('tapctl.exe', ['list']), ElevationUnavailableError);
+  });
+});
+
 describe('ElevatedBroker', () => {
   it('runs a command through the fake elevated helper', async () => {
     const helper = startFakeHelper();
@@ -95,6 +155,28 @@ describe('ElevatedBroker', () => {
       assert.equal(result.exitCode, 0);
       assert.equal(result.stdout.toString(), 'ran:tapctl.exe');
       assert.equal(result.stderr.toString(), '');
+    } finally {
+      await broker.dispose();
+      destroyAll(helper);
+    }
+  });
+
+  it('passes a branded launcher path to the launcher', async () => {
+    const helper = startFakeHelper();
+    const seen: ElevatedLaunchOptions[] = [];
+    const broker = new ElevatedBroker({
+      launcherPath: 'C:\\Brand\\AcmeElevate.exe',
+      launch: async (options) => {
+        seen.push(options);
+        await helper.launch(options);
+      },
+      handshakeTimeoutMs: 2000,
+      commandTimeoutMs: 2000,
+    });
+    try {
+      await broker.run('tapctl.exe', ['list']);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0]?.launcherPath, 'C:\\Brand\\AcmeElevate.exe');
     } finally {
       await broker.dispose();
       destroyAll(helper);

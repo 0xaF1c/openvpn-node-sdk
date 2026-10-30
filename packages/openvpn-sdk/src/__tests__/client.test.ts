@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   ElevationCancelledError,
+  ElevationUnavailableError,
   OpenVpnClient,
   OpenVpnServer,
   OvpnConfig,
@@ -16,6 +17,8 @@ import {
   type ElevatedCommandResult,
   type ElevatedProcessLike,
 } from '../index.ts';
+
+const isWindows = process.platform === 'win32';
 
 class FakeProcess extends EventEmitter implements SpawnedProcess {
   pid = 12345;
@@ -123,7 +126,7 @@ class FakeBroker implements ElevatedBrokerLike {
 }
 
 describe('OpenVpnClient orchestration', () => {
-  it('spawns, connects to management, handles state and auth challenges', async () => {
+  it('spawns, connects to management, handles state and auth challenges', { skip: !isWindows && 'Windows adapter/dev-node flow' }, async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fake = new FakeProcessManager();
@@ -191,7 +194,7 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('uses the elevated broker when the process is not elevated', async () => {
+  it('uses the elevated broker when the process is not elevated', { skip: !isWindows && 'UAC is Windows-only' }, async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
@@ -243,7 +246,7 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('always elevates when elevation is "always" even in an elevated process', async () => {
+  it('always elevates when elevation is "always" even in an elevated process', { skip: !isWindows && 'UAC is Windows-only' }, async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
@@ -272,7 +275,7 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('cleans up when the elevated process exits before disconnect', async () => {
+  it('cleans up when the elevated process exits before disconnect', { skip: !isWindows && 'UAC is Windows-only' }, async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
@@ -305,22 +308,20 @@ describe('OpenVpnClient orchestration', () => {
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
     const fakeAdapters = new FakeAdapterManager();
-    const broker = new FakeBroker();
 
     const client = new OpenVpnClient('dev null\n', {
       binary: process.execPath,
       processManager: fakeManager,
       adapterManager: fakeAdapters,
-      broker,
       managementHost: '127.0.0.1',
       managementPort: port,
       disconnectTimeoutMs: 20,
-      elevation: 'always',
+      elevation: 'never',
       manageAdapter: false,
     });
 
     await client.connect();
-    const start = broker.spawned[0];
+    const start = fakeManager.started[0];
     assert.ok(start);
     const configIndex = start.args.indexOf('--config');
     const configPath = configIndex >= 0 ? (start.args[configIndex + 1] ?? '') : '';
@@ -332,7 +333,7 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('propagates a cancelled UAC prompt and aborts the connection', async () => {
+  it('propagates a cancelled UAC prompt and aborts the connection', { skip: !isWindows && 'UAC is Windows-only' }, async () => {
     const fakeManager = new FakeProcessManager();
     const fakeAdapters = new FakeAdapterManager();
     const broker = new FakeBroker();
@@ -372,6 +373,42 @@ describe('OpenVpnClient orchestration', () => {
     await client.waitFor('CONNECTED', 1000); // should resolve immediately
     await client.disconnect();
     await server.stop();
+  });
+
+  it('never starts the UAC broker on POSIX', { skip: isWindows && 'Windows uses the UAC helper' }, async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const fakeAdapters = new FakeAdapterManager();
+    const broker = new FakeBroker();
+
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      broker,
+      managementHost: '127.0.0.1',
+      managementPort: port,
+      disconnectTimeoutMs: 20,
+      manageAdapter: false,
+    });
+
+    await client.connect();
+    assert.equal(broker.spawned.length, 0);
+    assert.equal(fakeManager.started.length, 1);
+    await client.disconnect();
+    await server.stop();
+  });
+
+  it('rejects elevation: "always" with ElevationUnavailableError on POSIX', { skip: isWindows && 'Windows supports UAC' }, async () => {
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      managementPort: 1,
+      disconnectTimeoutMs: 20,
+      elevation: 'always',
+      manageAdapter: false,
+    });
+    await assert.rejects(() => client.connect(), ElevationUnavailableError);
   });
 });
 

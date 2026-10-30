@@ -55,15 +55,25 @@ export class ElevationUnavailableError extends ElevationError {
   }
 }
 
-/** True when the current process runs with an elevated (administrator) token. */
+/**
+ * True when the current process already has administrator/root privileges.
+ *
+ * Windows: `net session` succeeds only for an elevated token. POSIX: the
+ * effective uid is 0. Other platforms: no elevation model, so `true`.
+ */
 export async function isElevated(): Promise<boolean> {
-  if (process.platform !== 'win32') return true;
-  try {
-    await execFileAsync('net', ['session'], { windowsHide: true, timeout: 5000 });
-    return true;
-  } catch {
-    return false;
+  if (process.platform === 'win32') {
+    try {
+      await execFileAsync('net', ['session'], { windowsHide: true, timeout: 5000 });
+      return true;
+    } catch {
+      return false;
+    }
   }
+  if (typeof process.getuid === 'function') {
+    return process.getuid() === 0;
+  }
+  return true;
 }
 
 export interface ElevatedCommandResult {
@@ -102,6 +112,8 @@ export interface ElevatedLaunchOptions {
   token: string;
   helperPath: string;
   nodePath: string;
+  /** Branded launcher executable to elevate instead of `nodePath`. */
+  launcherPath?: string;
 }
 
 export interface ElevatedBrokerOptions {
@@ -113,6 +125,17 @@ export interface ElevatedBrokerOptions {
   helperPath?: string;
   /** Node.js executable used for the helper (default `process.execPath`). */
   nodePath?: string;
+  /**
+   * Windows: a branded launcher executable to elevate instead of `nodePath`.
+   *
+   * The UAC consent dialog shows the **elevated executable's** icon, program
+   * name (`FileDescription`) and Authenticode publisher, so a custom launcher
+   * is the only way to brand it. The launcher is started as
+   * `launcher <nodePath> <helperPath> --port <p> --token <t>` and must run
+   * `nodePath` with the remaining arguments (see
+   * `scripts/build-elevate-launcher.ps1`).
+   */
+  launcherPath?: string;
   /** Injectable launcher (tests). Defaults to PowerShell `Start-Process -Verb RunAs`. */
   launch?: (options: ElevatedLaunchOptions) => Promise<void>;
 }
@@ -192,23 +215,58 @@ function defaultHelperPath(): string {
   return existsSync(source) ? source : compiled;
 }
 
-async function defaultLaunch(options: ElevatedLaunchOptions): Promise<void> {
-  // `Start-Process -Verb RunAs` is the only UAC entry point available from
-  // pure Node.js. The helper arguments are pre-quoted because Start-Process
-  // joins `-ArgumentList` with spaces without quoting.
-  const helperArguments = [options.helperPath, '--port', String(options.port), '--token', options.token]
-    .map(quoteWindowsArgument)
-    .join(' ');
-  const script = [
-    `Start-Process -FilePath ${powerShellQuote(options.nodePath)}`,
-    `-ArgumentList ${powerShellQuote(helperArguments)}`,
+export interface ElevatedLaunchCommand {
+  /** Executable that is elevated (the branded launcher or `nodePath`). */
+  targetFile: string;
+  /** Pre-quoted command line passed to the target. */
+  targetArguments: string;
+  /** PowerShell one-liner that triggers the UAC prompt. */
+  powerShellScript: string;
+}
+
+/**
+ * Build the command used to start the elevated helper.
+ *
+ * Without a launcher the target is `node <helper> --port … --token …`.
+ * With a launcher the target is `launcher <node> <helper> --port … --token …`;
+ * the launcher just forwards the remaining arguments to `node`, which makes the
+ * UAC consent dialog show the launcher's icon/name/publisher instead of
+ * Node.js.
+ */
+export function buildElevatedLaunchCommand(options: {
+  nodePath: string;
+  helperPath: string;
+  port: number;
+  token: string;
+  launcherPath?: string;
+}): ElevatedLaunchCommand {
+  const helperArguments = ['--port', String(options.port), '--token', options.token];
+  const targetFile = options.launcherPath ?? options.nodePath;
+  const argv = options.launcherPath === undefined
+    ? [options.helperPath, ...helperArguments]
+    : [options.nodePath, options.helperPath, ...helperArguments];
+  const targetArguments = argv.map(quoteWindowsArgument).join(' ');
+  const powerShellScript = [
+    `Start-Process -FilePath ${powerShellQuote(targetFile)}`,
+    `-ArgumentList ${powerShellQuote(targetArguments)}`,
     '-Verb RunAs -WindowStyle Hidden',
   ].join(' ');
+  return { targetFile, targetArguments, powerShellScript };
+}
+
+async function defaultLaunch(options: ElevatedLaunchOptions): Promise<void> {
+  if (process.platform !== 'win32') {
+    throw new ElevationUnavailableError('UAC elevation is only available on Windows');
+  }
+  // `Start-Process -Verb RunAs` is the only UAC entry point available from
+  // pure Node.js. The arguments are pre-quoted because Start-Process joins
+  // `-ArgumentList` with spaces without quoting.
+  const { powerShellScript } = buildElevatedLaunchCommand(options);
 
   try {
     await execFileAsync(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', powerShellScript],
       { windowsHide: true, timeout: 120_000 },
     );
   } catch (err) {
@@ -326,6 +384,7 @@ export class ElevatedBroker implements ElevatedBrokerLike {
   readonly commandTimeoutMs: number;
   readonly helperPath: string;
   readonly nodePath: string;
+  readonly launcherPath: string | undefined;
 
   private readonly launch: (options: ElevatedLaunchOptions) => Promise<void>;
   private server: Server | null = null;
@@ -343,6 +402,7 @@ export class ElevatedBroker implements ElevatedBrokerLike {
     this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_ELEVATION_COMMAND_TIMEOUT_MS;
     this.helperPath = options.helperPath ?? defaultHelperPath();
     this.nodePath = options.nodePath ?? process.execPath;
+    this.launcherPath = options.launcherPath;
     this.launch = options.launch ?? defaultLaunch;
   }
 
@@ -444,10 +504,6 @@ export class ElevatedBroker implements ElevatedBrokerLike {
   }
 
   private async start(): Promise<void> {
-    if (process.platform !== 'win32') {
-      throw new ElevationUnavailableError('UAC elevation is only available on Windows');
-    }
-
     const server = createServer((socket) => this.accept(socket));
     this.server = server;
     await new Promise<void>((resolve, reject) => {
@@ -504,6 +560,7 @@ export class ElevatedBroker implements ElevatedBrokerLike {
         token: this.token,
         helperPath: this.helperPath,
         nodePath: this.nodePath,
+        ...(this.launcherPath === undefined ? {} : { launcherPath: this.launcherPath }),
       });
       await handshake;
     } catch (err) {

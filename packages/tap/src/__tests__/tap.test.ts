@@ -68,7 +68,7 @@ describe('parse helpers', () => {
   });
 });
 
-describe('AdapterManager with injected exec', () => {
+describe('AdapterManager with injected exec', { skip: process.platform !== 'win32' && 'tapctl is Windows-only' }, () => {
   it('list parses tapctl output', async () => {
     const { exec, calls } = fakeExec([
       { args: ['list'], result: { stdout: wide('{a}' + TAB + 'adapter' + TAB + 'tap0901' + NL), stderr: Buffer.alloc(0), exitCode: 0 } },
@@ -208,5 +208,20 @@ describe('AdapterManager with injected exec', () => {
     const { exec } = fakeExec([{ args: ['session'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } }]);
     const mgr = new AdapterManager({ exec });
     assert.equal(await mgr.isElevated(), true);
+  });
+});
+
+describe('AdapterManager on POSIX', { skip: process.platform === 'win32' && 'Windows adapter management' }, () => {
+  it('never runs tapctl and reports no adapters', async () => {
+    let called = false;
+    const exec: TapctlExec = async () => {
+      called = true;
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
+    };
+    const mgr = new AdapterManager({ exec, elevatedExec: exec });
+    assert.deepEqual(await mgr.list(), []);
+    assert.equal(await mgr.ensure(), null);
+    assert.equal(await mgr.isElevated(), true);
+    assert.equal(called, false);
   });
 });

@@ -23,18 +23,20 @@ describe('parseOpenVpnVersion', () => {
 });
 
 describe('BinaryManager resolution order', () => {
+  const exeName = process.platform === 'win32' ? 'openvpn.exe' : 'openvpn';
+
   it('prefers explicit option, then env, then platform package, then install dir/path', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-bin-test-'));
-    const explicit = path.join(dir, 'explicit-openvpn.exe');
-    const env = path.join(dir, 'env-openvpn.exe');
-    const bundled = path.join(dir, 'bundled-openvpn.exe');
+    const explicit = path.join(dir, `explicit-${exeName}`);
+    const env = path.join(dir, `env-${exeName}`);
+    const bundled = path.join(dir, `bundled-${exeName}`);
     await Promise.all([
       writeFile(explicit, ''),
       writeFile(env, ''),
       writeFile(bundled, ''),
     ]);
 
-    const resolve = (specifier: string) => (specifier.endsWith('/bin/openvpn.exe') ? bundled : null);
+    const resolve = (specifier: string) => (specifier.endsWith(`/bin/${exeName}`) ? bundled : null);
 
     // 1. explicit wins
     const withExplicit = new BinaryManager({ openvpnBinary: explicit, platformResolver: resolve });
@@ -72,16 +74,20 @@ describe('BinaryManager resolution order', () => {
 });
 
 describe('platform package metadata', () => {
+  const packageName = getPlatformPackageName(process.platform, process.arch);
+  const packageDirName = packageName.split('/')[1] ?? packageName;
+  const exeName = process.platform === 'win32' ? 'openvpn.exe' : 'openvpn';
+
   async function makePlatformPackage(openvpnVersion: string) {
     const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-pkg-meta-'));
-    const pkgDir = path.join(dir, 'node_modules', '@ovpn-sdk', 'openvpn-win32-x64');
+    const pkgDir = path.join(dir, 'node_modules', '@ovpn-sdk', packageDirName);
     await mkdir(path.join(pkgDir, 'bin'), { recursive: true });
     await writeFile(
       path.join(pkgDir, 'package.json'),
-      JSON.stringify({ name: '@ovpn-sdk/openvpn-win32-x64', version: '2.7.5-1', openvpnVersion }),
+      JSON.stringify({ name: packageName, version: '2.7.5-1', openvpnVersion }),
       'utf8',
     );
-    const binary = path.join(pkgDir, 'bin', 'openvpn.exe');
+    const binary = path.join(pkgDir, 'bin', exeName);
     await writeFile(binary, '');
     const resolver = (specifier: string) =>
       specifier.endsWith('/package.json') ? path.join(pkgDir, 'package.json') : null;
@@ -100,7 +106,7 @@ describe('platform package metadata', () => {
     const mismatch = new BinaryManager({ platformResolver: resolver, expectedVersion: '2.7.5' });
     assert.throws(
       () => mismatch.resolveOpenVpn(),
-      /expected OpenVPN 2\.7\.5, but platform package @ovpn-sdk\/openvpn-win32-x64 provides 2\.6\.12/,
+      /expected OpenVPN 2\.7\.5, but platform package .* provides 2\.6\.12/,
     );
 
     const match = new BinaryManager({ platformResolver: resolver, expectedVersion: '2.6.12' });
@@ -110,11 +116,11 @@ describe('platform package metadata', () => {
 
   it('falls through when the platform package has metadata but no binary', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-pkg-empty-'));
-    const pkgDir = path.join(dir, 'node_modules', '@ovpn-sdk', 'openvpn-win32-x64');
+    const pkgDir = path.join(dir, 'node_modules', '@ovpn-sdk', packageDirName);
     await mkdir(pkgDir, { recursive: true });
     await writeFile(
       path.join(pkgDir, 'package.json'),
-      JSON.stringify({ name: '@ovpn-sdk/openvpn-win32-x64', openvpnVersion: '2.7.5' }),
+      JSON.stringify({ name: packageName, openvpnVersion: '2.7.5' }),
       'utf8',
     );
     const resolver = (specifier: string) =>

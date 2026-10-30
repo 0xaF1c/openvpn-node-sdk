@@ -33,6 +33,7 @@ import {
   AdapterManager,
   ElevatedBroker,
   ElevationError,
+  ElevationUnavailableError,
   isElevated as probeElevation,
   type AdapterManagerLike,
   type ElevatedBrokerLike,
@@ -89,6 +90,15 @@ export interface OpenVpnClientOptions {
    * caller and is never disposed.
    */
   broker?: ElevatedBrokerLike;
+  /**
+   * Windows: branded launcher executable to elevate instead of Node.js.
+   *
+   * The UAC consent dialog shows the elevated executable's icon, program name
+   * (`FileDescription`) and publisher. Build one with
+   * `scripts/build-elevate-launcher.ps1` (optionally sign it with `signtool`)
+   * and point this option at it. Ignored when `broker` is provided.
+   */
+  elevateLauncher?: string;
   /** Override the elevation probe used by `elevation: 'auto'` (tests). */
   isElevated?: () => Promise<boolean>;
 }
@@ -255,7 +265,9 @@ export class OpenVpnClient extends EventEmitter {
     const mode = this.options.elevation ?? 'auto';
     if (process.platform !== 'win32') {
       if (mode === 'always') {
-        throw new Error("elevation: 'always' requires Windows and UAC");
+        throw new ElevationUnavailableError(
+          "elevation: 'always' requires Windows and UAC; on Linux/macOS run the process as root (sudo, pkexec or a service) instead",
+        );
       }
       return { useElevation: false };
     }
@@ -314,7 +326,11 @@ export class OpenVpnClient extends EventEmitter {
   /** Lazily create the UAC broker shared by the adapter and process paths. */
   private getBroker(): ElevatedBrokerLike {
     if (this.broker === null) {
-      this.broker = this.options.broker ?? new ElevatedBroker();
+      this.broker = this.options.broker ?? new ElevatedBroker({
+        ...(this.options.elevateLauncher === undefined
+          ? {}
+          : { launcherPath: this.options.elevateLauncher }),
+      });
       this.brokerOwned = this.options.broker === undefined;
     }
     return this.broker;
@@ -716,6 +732,7 @@ export {
   ElevationCancelledError,
   ElevationError,
   ElevationUnavailableError,
+  buildElevatedLaunchCommand,
   decodeTapctl,
   isElevated,
   parseAdapterList,
@@ -723,6 +740,7 @@ export {
   type AdapterInfo,
   type AdapterManagerLike,
   type ElevatedBrokerLike,
+  type ElevatedBrokerOptions,
   type ElevatedCommandOptions,
   type ElevatedCommandResult,
   type ElevatedLaunchOptions,

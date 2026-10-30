@@ -48,6 +48,20 @@ declined, `connect()` rejects with `ElevationCancelledError`. See
 [Windows elevation (UAC)](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-elevation.md)
 for the elevation modes, standalone `ElevatedBroker` usage and troubleshooting.
 
+### Platform support
+
+| Platform | Adapter management | Elevation |
+|---|---|---|
+| Windows | `tapctl.exe` through the UAC helper | UAC prompt (`elevation: 'auto'`, the default); brand it with `elevateLauncher` |
+| Linux | — (OpenVPN creates the tun/tap device) | run the process as root; `auto` spawns directly, `always` throws |
+| macOS | — | same as Linux |
+
+Management protocol negotiation is version-aware: OpenVPN 2.7+ advertises
+management version 6 and acknowledges `version 6`; OpenVPN 2.6 advertises
+version 5 and never answers that command, so the SDK skips the negotiation
+instead of timing out (state/log/bytecount and the rest of the init sequence
+work unchanged).
+
 ## Quick start — server
 
 ```ts
@@ -100,6 +114,7 @@ new OpenVpnClient(config: OvpnConfig | string, options?: OpenVpnClientOptions)
 | `adapterManager` | `AdapterManagerLike` | `AdapterManager` | Injectable adapter manager. |
 | `elevation` | `'auto'` / `'always'` / `'never'` | `'auto'` | Windows: `auto` shows a UAC prompt when the process is not elevated; `always` forces the elevated helper; `never` always spawns directly. |
 | `broker` | `ElevatedBrokerLike` | `ElevatedBroker` | Injectable UAC broker (tests/custom elevation). |
+| `elevateLauncher` | `string` | — | Windows: branded launcher executable to elevate (controls the UAC icon/name/publisher). Build it with `scripts/build-elevate-launcher.ps1`. |
 | `isElevated` | `() => Promise<boolean>` | `AdapterManager.isElevated()` | Injectable elevation probe used by `elevation: 'auto'`. |
 
 ### Properties
@@ -266,7 +281,18 @@ try {
 ```
 
 Options: `handshakeTimeoutMs` (default 120 s), `commandTimeoutMs` (30 s),
-`helperPath`, `nodePath`, `launch`.
+`helperPath`, `nodePath`, `launcherPath`, `launch`.
+
+The UAC prompt's icon, program name and publisher come from the elevated
+executable. By default that is `node.exe`; build a branded launcher with
+`scripts/build-elevate-launcher.ps1 -Title "Acme VPN" -Icon acme.ico`, sign it,
+and pass `elevateLauncher` (or `launcherPath`) to show your own brand instead of
+"Node.js". The dialog title/body are drawn by Windows and cannot be changed.
+
+On Linux/macOS `elevation: 'auto'` spawns directly (no UAC helper), `isElevated()`
+checks uid 0, and `elevation: 'always'` throws `ElevationUnavailableError`; run
+the process as root (sudo/systemd) when OpenVPN needs a tun device or routes.
+Adapter management and `elevateLauncher`/`ElevatedBroker` are Windows-only.
 
 Also exported: `isElevated()`, `ElevatedProcess`, `ElevationError`,
 `ElevationCancelledError`, `ElevationUnavailableError`, and the

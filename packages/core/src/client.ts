@@ -71,6 +71,8 @@ export class ManagementClient extends EventEmitter {
 
   protocolVersion = 1;
   welcomeLine = '';
+  /** Management protocol version advertised by the server (0 = unknown). */
+  serverManagementVersion = 0;
 
   constructor(options: ManagementClientOptions) {
     super();
@@ -144,8 +146,17 @@ export class ManagementClient extends EventEmitter {
     });
   }
 
-  async initialize(sequence: ManagementInitCommand[] = this.options.initSequence ?? DEFAULT_INIT_SEQUENCE): Promise<void> {
-    for (const item of sequence) {
+  /**
+   * Run the management init sequence.
+   *
+   * OpenVPN advertises its management protocol version in the welcome banner.
+   * Protocol 6 (OpenVPN 2.7+) acknowledges `version 6`; 2.6 and older advertise
+   * 5 and silently apply (or ignore) the command, so waiting for a reply there
+   * would time out. Only negotiate when the server advertises 6 or later.
+   */
+  async initialize(sequence?: ManagementInitCommand[]): Promise<void> {
+    const items = sequence ?? this.options.initSequence ?? this.defaultInitSequence();
+    for (const item of items) {
       const result = await this.send(item.command, { expect: item.expect });
       if (item.command.startsWith('version ') && result.success) {
         const match = result.success.match(/(\d+)/);
@@ -155,11 +166,19 @@ export class ManagementClient extends EventEmitter {
     this.emit('initialized');
   }
 
+  private defaultInitSequence(): ManagementInitCommand[] {
+    if (this.serverManagementVersion >= 6 || this.serverManagementVersion === 0) {
+      return DEFAULT_INIT_SEQUENCE;
+    }
+    return DEFAULT_INIT_SEQUENCE.filter((item) => !item.command.startsWith('version '));
+  }
+
   private async openSocket(): Promise<void> {
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
     }
+    this.serverManagementVersion = 0;
     this.readyPromise = new Promise<void>((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
@@ -203,6 +222,7 @@ export class ManagementClient extends EventEmitter {
    */
   attachSocket(socket: Socket): Promise<void> {
     this.socket = socket;
+    this.serverManagementVersion = 0;
     socket.setEncoding('utf8');
     socket.on('connect', () => this.emit('socket-connect'));
     socket.on('error', (err) => {
@@ -229,6 +249,10 @@ export class ManagementClient extends EventEmitter {
       const classified = classifyLine(line);
       if (classified.type === 'notify' && classified.kind === 'INFO' && classified.payload.includes('OpenVPN Management Interface')) {
         this.welcomeLine = classified.raw;
+        const versionMatch = /Management Interface Version (\d+)/i.exec(classified.payload);
+        if (versionMatch?.[1] !== undefined) {
+          this.serverManagementVersion = Number(versionMatch[1]);
+        }
         if (this.welcomeTimer) {
           clearTimeout(this.welcomeTimer);
           this.welcomeTimer = null;
