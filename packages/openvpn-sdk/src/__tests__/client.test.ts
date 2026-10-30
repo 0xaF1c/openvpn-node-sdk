@@ -3,16 +3,18 @@ import { EventEmitter } from 'node:events';
 import { describe, it } from 'node:test';
 import { MockManagementServer } from '@ovpn-sdk/core';
 import { type ProcessManagerLike, type SpawnedProcess } from '@ovpn-sdk/process';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
+  ElevationCancelledError,
   OpenVpnClient,
   OpenVpnServer,
   OvpnConfig,
-  type OpenvpnServiceClientLike,
-  type OpenvpnStartOptions,
-  type ServiceOpenVpnProcessLike,
+  type ElevatedBrokerLike,
+  type ElevatedCommandOptions,
+  type ElevatedCommandResult,
+  type ElevatedProcessLike,
 } from '../index.ts';
 
 class FakeProcess extends EventEmitter implements SpawnedProcess {
@@ -32,6 +34,7 @@ class FakeAdapterManager {
   readonly ensureCalls: Array<{ hwid?: string }> = [];
   readonly released: string[] = [];
   adapter = { guid: '{adapter-guid}', name: 'SDK TAP Adapter', hwid: 'ovpn-dco' };
+  elevated = false;
 
   async ensure(opts: { hwid?: string } = {}): Promise<{ guid: string; name: string; hwid: string }> {
     this.ensureCalls.push(opts);
@@ -43,7 +46,7 @@ class FakeAdapterManager {
   }
 
   async isElevated(): Promise<boolean> {
-    return false;
+    return this.elevated;
   }
 }
 
@@ -63,49 +66,59 @@ class FakeProcessManager implements ProcessManagerLike {
   }
 }
 
-class FakeServiceProcess extends EventEmitter implements ServiceOpenVpnProcessLike {
-  readonly pid: number;
+class FakeElevatedProcess extends EventEmitter implements ElevatedProcessLike {
+  pid = 4242;
   exitCode: number | null = null;
-  lastError = '';
+  killed = false;
+  private stdout = '';
+  private stderr = '';
 
-  constructor(pid = 4242) {
-    super();
-    this.pid = pid;
+  getStdout(): string {
+    return this.stdout;
   }
 
-  kill(): boolean {
+  getStderr(): string {
+    return this.stderr;
+  }
+
+  kill(signal?: NodeJS.Signals): boolean {
     if (this.exitCode !== null) return false;
+    this.killed = true;
     this.exitCode = 0;
-    this.emit('exit', 0, null);
+    this.emit('exit', 0, signal ?? 'SIGTERM');
     return true;
   }
 
-  close(): void {
-    if (this.exitCode === null) {
-      this.exitCode = 0;
-      this.emit('exit', 0, null);
-    }
+  finish(code: number | null = 0): void {
+    if (this.exitCode !== null) return;
+    this.exitCode = code;
+    this.emit('exit', code, null);
   }
 }
 
-class FakeServiceClient implements OpenvpnServiceClientLike {
-  available = true;
-  readonly started: OpenvpnStartOptions[] = [];
-  readonly adapterTypes: number[] = [];
-  readonly process = new FakeServiceProcess();
+class FakeBroker implements ElevatedBrokerLike {
+  readonly spawned: Array<{ file: string; args: string[]; options?: ElevatedCommandOptions }> = [];
+  readonly runs: Array<{ file: string; args: string[] }> = [];
+  readonly process = new FakeElevatedProcess();
+  disposed = false;
+  spawnError: Error | null = null;
+  runResult: ElevatedCommandResult = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
 
-  async isAvailable(): Promise<boolean> {
-    return this.available;
+  async run(file: string, args: string[]): Promise<ElevatedCommandResult> {
+    this.runs.push({ file, args });
+    return this.runResult;
   }
 
-  async createAdapter(adapterType: number): Promise<number> {
-    this.adapterTypes.push(adapterType);
-    return 0;
-  }
-
-  async startOpenVpn(options: OpenvpnStartOptions): Promise<ServiceOpenVpnProcessLike> {
-    this.started.push(options);
+  async spawn(file: string, args: string[], options?: ElevatedCommandOptions): Promise<ElevatedProcessLike> {
+    if (this.spawnError) throw this.spawnError;
+    this.spawned.push({ file, args, ...(options === undefined ? {} : { options }) });
     return this.process;
+  }
+
+  async kill(): Promise<void> {}
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
   }
 }
 
@@ -178,50 +191,107 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('automatically chooses openvpnserv for a non-elevated process', async () => {
+  it('uses the elevated broker when the process is not elevated', async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
-    const service = new FakeServiceClient();
     const fakeAdapters = new FakeAdapterManager();
+    const broker = new FakeBroker();
 
     const client = new OpenVpnClient('dev null\n', {
       binary: process.execPath,
       processManager: fakeManager,
       adapterManager: fakeAdapters,
+      broker,
       managementHost: '127.0.0.1',
       managementPort: port,
       disconnectTimeoutMs: 20,
       manageAdapter: false,
-      serviceClient: service,
     });
 
     await client.connect();
     assert.equal(fakeManager.started.length, 0);
-    assert.equal(service.started.length, 1);
+    assert.equal(broker.spawned.length, 1);
+    assert.match(broker.spawned[0]?.args.join(' ') ?? '', /--management 127\.0\.0\.1 /);
     await client.disconnect();
     await server.stop();
   });
 
-  it('cleans up when the service process exits before disconnect', async () => {
+  it('spawns directly when the process is already elevated', async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
-    const service = new FakeServiceClient();
     const fakeAdapters = new FakeAdapterManager();
+    fakeAdapters.elevated = true;
+    const broker = new FakeBroker();
 
     const client = new OpenVpnClient('dev null\n', {
       binary: process.execPath,
       processManager: fakeManager,
       adapterManager: fakeAdapters,
+      broker,
       managementHost: '127.0.0.1',
       managementPort: port,
-      elevation: 'service',
-      serviceClient: service,
+      disconnectTimeoutMs: 20,
+      manageAdapter: false,
     });
 
     await client.connect();
-    service.process.close(); // simulate OpenVPN exiting on its own
+    assert.equal(fakeManager.started.length, 1);
+    assert.equal(broker.spawned.length, 0);
+    await client.disconnect();
+    await server.stop();
+  });
+
+  it('always elevates when elevation is "always" even in an elevated process', async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const fakeAdapters = new FakeAdapterManager();
+    fakeAdapters.elevated = true;
+    const broker = new FakeBroker();
+
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      broker,
+      managementHost: '127.0.0.1',
+      managementPort: port,
+      disconnectTimeoutMs: 20,
+      manageAdapter: false,
+      elevation: 'always',
+      registerDns: true,
+    });
+
+    await client.connect();
+    assert.equal(fakeManager.started.length, 0);
+    assert.equal(broker.spawned.length, 1);
+    assert.ok(broker.spawned[0]?.args.includes('--register-dns'));
+    await client.disconnect();
+    await server.stop();
+  });
+
+  it('cleans up when the elevated process exits before disconnect', async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const fakeAdapters = new FakeAdapterManager();
+    const broker = new FakeBroker();
+
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      broker,
+      managementHost: '127.0.0.1',
+      managementPort: port,
+      disconnectTimeoutMs: 20,
+      elevation: 'always',
+    });
+
+    await client.connect();
+    broker.process.finish(1);
     await new Promise((resolve) => setTimeout(resolve, 10));
     await client.disconnect();
 
@@ -230,85 +300,58 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('writes and cleans the profile in serviceConfigDir', async () => {
-    const configDir = await mkdtemp(path.join(tmpdir(), 'ovpn-sdk-test-'));
+  it('writes the profile to a temp directory and removes it on disconnect', async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
-    const service = new FakeServiceClient();
     const fakeAdapters = new FakeAdapterManager();
+    const broker = new FakeBroker();
 
-    try {
-      const client = new OpenVpnClient('dev null\n', {
-        binary: process.execPath,
-        processManager: fakeManager,
-        adapterManager: fakeAdapters,
-        managementHost: '127.0.0.1',
-        managementPort: port,
-        disconnectTimeoutMs: 20,
-        elevation: 'service',
-        serviceClient: service,
-        serviceConfigDir: configDir,
-      });
-
-      await client.connect();
-      const start = service.started[0];
-      assert.ok(start);
-      const match = start.options.match(/--config ("[^"]+"|\S+)/);
-      const configPath = (match?.[1] ?? '').replace(/^"|"$/g, '');
-      assert.ok(configPath.startsWith(configDir), start.options);
-      assert.deepEqual(await readdir(configDir), [path.basename(configPath)]);
-
-      await client.disconnect();
-      assert.deepEqual(await readdir(configDir), []);
-    } finally {
-      await rm(configDir, { recursive: true, force: true });
-      await server.stop();
-    }
-  });
-
-  it('launches through openvpnserv when elevation is required', async () => {
-    const server = new MockManagementServer();
-    const port = await server.start();
-    const fakeManager = new FakeProcessManager();
-    const service = new FakeServiceClient();
-    const fakeAdapters = new FakeAdapterManager();
-
-    const client = new OpenVpnClient(
-      new OvpnConfig().client().remote('vpn.example.com', 1194, 'udp').dev('tun'),
-      {
-        binary: process.execPath,
-        processManager: fakeManager,
-        adapterManager: fakeAdapters,
-        managementHost: '127.0.0.1',
-        managementPort: port,
-        disconnectTimeoutMs: 20,
-        elevation: 'service',
-        serviceClient: service,
-      },
-    );
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      broker,
+      managementHost: '127.0.0.1',
+      managementPort: port,
+      disconnectTimeoutMs: 20,
+      elevation: 'always',
+      manageAdapter: false,
+    });
 
     await client.connect();
-
-    // No direct spawn: the service owns the OpenVPN process.
-    assert.equal(fakeManager.started.length, 0);
-    assert.equal(service.started.length, 1);
-    const start = service.started[0];
+    const start = broker.spawned[0];
     assert.ok(start);
-    assert.ok(start.workingDirectory.length > 0);
-    assert.match(start.options, /--config/);
-    assert.match(start.options, /--management 127\.0\.0\.1 /);
-    assert.match(start.options, /--log/);
-
-    const configMatch = start.options.match(/--config ("[^"]+"|\S+)/);
-    assert.ok(configMatch);
-    const configPath = (configMatch[1] ?? '').replace(/^"|"$/g, '');
-    const configText = await readFile(configPath, 'utf8');
-    assert.ok(configText.includes('dev-node "SDK TAP Adapter"'), configText);
+    const configIndex = start.args.indexOf('--config');
+    const configPath = configIndex >= 0 ? (start.args[configIndex + 1] ?? '') : '';
+    assert.ok(configPath.startsWith(tmpdir()), configPath);
+    assert.ok((await readdir(path.dirname(configPath))).includes(path.basename(configPath)));
 
     await client.disconnect();
-    assert.deepEqual(fakeAdapters.released, ['{adapter-guid}']);
+    await assert.rejects(() => readFile(configPath, 'utf8'), /ENOENT/);
     await server.stop();
+  });
+
+  it('propagates a cancelled UAC prompt and aborts the connection', async () => {
+    const fakeManager = new FakeProcessManager();
+    const fakeAdapters = new FakeAdapterManager();
+    const broker = new FakeBroker();
+    broker.spawnError = new ElevationCancelledError('the user cancelled the UAC prompt');
+
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: fakeAdapters,
+      broker,
+      managementPort: 1,
+      disconnectTimeoutMs: 20,
+      elevation: 'always',
+      manageAdapter: false,
+    });
+
+    await assert.rejects(() => client.connect(), ElevationCancelledError);
+    assert.equal(fakeManager.started.length, 0);
+    assert.equal(client.currentState, null);
   });
 
   it('waitFor resolves immediately when already in the target state', async () => {

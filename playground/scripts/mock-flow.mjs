@@ -105,6 +105,8 @@ async function runClientFlow() {
     managementHost: '127.0.0.1',
     managementPort: server.port,
     manageAdapter: true,
+    // Fully offline: never touch the UAC helper.
+    elevation: 'never',
     connectTimeoutMs: 5000,
     disconnectTimeoutMs: 250,
     extraArgs: ['--verb', '3'],

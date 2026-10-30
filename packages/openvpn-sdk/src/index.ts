@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { BinaryManager } from '@ovpn-sdk/binary';
@@ -23,7 +23,6 @@ import {
 import {
   ProcessManager,
   buildOpenVpnArgs,
-  buildWindowsCommandLine,
   getFreePort,
   waitForSocketPath,
   waitForTcpPort,
@@ -32,18 +31,17 @@ import {
 } from '@ovpn-sdk/process';
 import {
   AdapterManager,
-  OpenvpnServiceClient,
-  OpenvpnServiceError,
-  readOpenvpnServiceSettings,
-  SERVICE_ERROR_STARTUP_DATA,
+  ElevatedBroker,
+  ElevationError,
+  isElevated as probeElevation,
   type AdapterManagerLike,
-  type AdapterServiceMode,
-  type OpenvpnServiceLauncherLike,
-  type ServiceOpenVpnProcessLike,
+  type ElevatedBrokerLike,
+  type ElevatedProcessLike,
+  type TapctlExecResult,
 } from '@ovpn-sdk/tap';
 
-/** Windows privilege strategy for `OpenVpnClient`. */
-export type ElevationMode = 'auto' | 'service' | 'never';
+/** Windows launch strategy for `OpenVpnClient`. */
+export type ElevationMode = 'auto' | 'always' | 'never';
 
 export interface OpenVpnCredentials {
   username: string;
@@ -73,34 +71,24 @@ export interface OpenVpnClientOptions {
   adapterHwid?: 'auto' | 'ovpn-dco' | 'root\\tap0901' | 'tap0901';
   /** Injectable adapter manager (tests). */
   adapterManager?: AdapterManagerLike;
-  /** Adapter creation strategy (default `'auto'`): `auto` / `always` / `never`. */
-  adapterServiceMode?: AdapterServiceMode;
   /**
-   * Windows privilege strategy (default `'auto'`):
-   * - `auto`: run through `openvpnserv` when the process is not elevated and
-   *   the interactive service is available; otherwise spawn OpenVPN directly;
-   * - `service`: always run through the interactive service;
-   * - `never`: always spawn directly (the service is only used for adapters).
+   * Windows launch strategy (default `'auto'`):
+   * - `auto`: request administrator rights with a UAC prompt when the current
+   *   process is not elevated (and use the elevated helper for `tapctl` too);
+   * - `always`: always launch OpenVPN through the elevated helper;
+   * - `never`: always spawn OpenVPN directly, even when not elevated.
    *
-   * The service runs its configured `exe_path`, ignores the `binary` option,
-   * and validates options/config locations; see the README.
+   * The elevated helper runs `openvpn.exe` and `tapctl.exe` as administrator.
+   * One UAC prompt is shown per connection attempt; a declined prompt throws
+   * `ElevationCancelledError`. See `docs/windows-elevation.md`.
    */
   elevation?: ElevationMode;
-  /** Override the interactive-service pipe name. */
-  servicePipe?: string;
-  /** Injectable interactive-service client (tests). */
-  serviceClient?: OpenvpnServiceLauncherLike;
   /**
-   * Directory in which to create the temporary profile when launching through
-   * `openvpnserv`. Non-admin users must use the service's `config_dir`
-   * (`HKLM\SOFTWARE\OpenVPN\config_dir`) or be a member of
-   * `ovpn_admin_group`; the SDK does not write to Program Files implicitly.
+   * Injectable UAC broker (tests or a custom elevation backend). The client
+   * disposes a broker it created itself; an injected broker is owned by the
+   * caller and is never disposed.
    */
-  serviceConfigDir?: string;
-  /** Capture OpenVPN's own log in the temp directory during service launches (default true). */
-  serviceLog?: boolean;
-  /** Timeout for the service to return the new OpenVPN pid (default 15000). */
-  serviceStartTimeoutMs?: number;
+  broker?: ElevatedBrokerLike;
   /** Override the elevation probe used by `elevation: 'auto'` (tests). */
   isElevated?: () => Promise<boolean>;
 }
@@ -119,16 +107,13 @@ export class OpenVpnClient extends EventEmitter {
 
   private readonly options: OpenVpnClientOptions;
   private readonly processManager: ProcessManagerLike;
-  private readonly serviceClient: OpenvpnServiceLauncherLike | null;
 
   private child: SpawnedProcess | null = null;
   protected management: ManagementClient | null = null;
   private tempDir: string | null = null;
   private configFile: string | null = null;
-  private configOutsideTemp = false;
-  private serviceProcess: ServiceOpenVpnProcessLike | null = null;
-  private serviceLogFile: string | null = null;
-  private launchedViaService = false;
+  private broker: ElevatedBrokerLike | null = null;
+  private brokerOwned = false;
   private connectInProgress = false;
   private current: OvpnState | null = null;
   private readonly stateHistory: OvpnState[] = [];
@@ -145,19 +130,24 @@ export class OpenVpnClient extends EventEmitter {
       openvpnBinary: options.binary,
       tapctlBinary: options.tapctlBinary,
     });
+    // The elevated helper does not share the caller's working directory/PATH
+    // guarantees, so prefer the resolved absolute tapctl path when available.
+    let tapctlBinary = options.tapctlBinary;
+    if (tapctlBinary === undefined && process.platform === 'win32') {
+      try {
+        tapctlBinary = this.binaries.resolveTapctl().path;
+      } catch {
+        // Fall back to `tapctl.exe` on PATH.
+      }
+    }
     this.adapters =
       options.adapterManager ??
       new AdapterManager({
-        binary: options.tapctlBinary,
-        ...(options.adapterServiceMode === undefined ? {} : { serviceMode: options.adapterServiceMode }),
+        ...(tapctlBinary === undefined ? {} : { binary: tapctlBinary }),
+        ...((options.elevation ?? 'auto') === 'never'
+          ? {}
+          : { elevatedExec: (file: string, args: string[]) => this.runElevatedTapctl(file, args) }),
       });
-    this.serviceClient =
-      options.serviceClient ??
-      (process.platform === 'win32'
-        ? new OpenvpnServiceClient({
-            ...(options.servicePipe === undefined ? {} : { pipePath: options.servicePipe }),
-          })
-        : null);
   }
 
   get currentState(): OvpnState | null {
@@ -181,25 +171,14 @@ export class OpenVpnClient extends EventEmitter {
         ? this.options.managementPort
         : await getFreePort();
 
-    const plan = await this.resolveServicePlan();
-    if (plan.useService && this.options.registerDns) {
-      throw new Error(
-        "`registerDns` cannot be used with openvpnserv elevation: --register-dns is not on the interactive service whitelist. " +
-          "Add `register-dns` to the profile, or use elevation: 'never'.",
-      );
-    }
-
-    // In service mode the service runs its configured exe_path; the SDK only
-    // needs a local binary for a direct spawn.
-    const binary = plan.useService ? 'openvpn' : this.binaries.resolveOpenVpn().path;
+    const plan = await this.resolveElevationPlan();
+    const binary = this.binaries.resolveOpenVpn().path;
 
     this.connectInProgress = true;
     try {
       if (process.platform === 'win32' && (this.options.manageAdapter ?? true)) {
         const adapter = await this.adapters.ensure({ hwid: this.options.adapterHwid ?? 'auto' });
         if (adapter) {
-          // The service cannot set an adapter name: when it creates the adapter
-          // there is no name to inject, so OpenVPN picks the first matching one.
           if (adapter.name !== '' && !this.configText.includes('dev-node')) {
             this.configText += 'dev-node ' + escapeArg(adapter.name) + '\n';
           }
@@ -208,7 +187,7 @@ export class OpenVpnClient extends EventEmitter {
       }
 
       this.tempDir = await mkdtemp(path.join(tmpdir(), 'ovpn-sdk-'));
-      await this.writeConfig(plan.useService);
+      await this.writeConfig();
       const configFile = this.configFile;
       if (configFile === null) throw new Error('the OpenVPN profile was not written');
 
@@ -218,34 +197,25 @@ export class OpenVpnClient extends EventEmitter {
         managementHost: host,
         managementPort: port,
         managementSocket: socketPath,
-        registerDns: plan.useService ? false : this.options.registerDns,
+        registerDns: this.options.registerDns,
         extraArgs: this.options.extraArgs,
       });
 
-      if (plan.useService) {
-        if (this.options.serviceLog !== false) {
-          this.serviceLogFile = path.join(this.tempDir, 'openvpn-service.log');
-          args.push('--log', this.serviceLogFile);
-        }
-        this.serviceProcess = await this.startViaService(args);
-        this.child = this.serviceProcess;
-        this.launchedViaService = true;
+      if (plan.useElevation) {
+        this.child = await this.startViaElevation(binary, args);
       } else {
         this.child = this.processManager.start(binary, args);
-        this.launchedViaService = false;
       }
 
       this.child.on('exit', (code, signal) => {
         this.emit('process-exit', { code, signal });
-        // Keep the temp directory (and the service log) until connect() has
-        // had a chance to include the log tail in its error message.
         if (!this.connectInProgress) void this.cleanup();
       });
 
       if (this.child.exitCode !== null && this.child.exitCode !== undefined) {
         throw new Error(
           `openvpn exited before the management socket became ready (code=${this.child.exitCode})` +
-            `${this.serviceErrorSuffix()}`,
+            this.childOutputSuffix(),
         );
       }
 
@@ -269,63 +239,29 @@ export class OpenVpnClient extends EventEmitter {
       this.connectInProgress = false;
       this.emit('management-connected');
     } catch (err) {
-      if (plan.useService) await this.attachServiceLog(err);
       this.connectInProgress = false;
       await this.abortConnect();
       throw err;
     }
   }
 
-  /** Append the tail of `--log` to a failed service launch (best effort). */
-  private async attachServiceLog(err: unknown): Promise<void> {
-    if (!(err instanceof Error) || this.serviceLogFile === null) return;
-    try {
-      const log = await readFile(this.serviceLogFile, 'utf8');
-      const tail = log.trim().split(/\r?\n/).slice(-8).join('\n');
-      if (tail !== '' && !err.message.includes(tail)) {
-        err.message += `\nOpenVPN log (tail):\n${tail}`;
-      }
-    } catch {
-      // No log file (validation error before OpenVPN started).
-    }
-  }
-
   /**
-   * Decide whether this connection should be brokered by `openvpnserv`.
+   * Decide whether this connection needs the elevated helper.
    *
-   * `auto` prefers the service only for non-elevated Windows processes. When
-   * the service is unreachable it falls back to a direct spawn, which works
-   * for elevated processes and for unprivileged tunnels (`dev null`).
+   * `auto` elevates whenever the current process is not already elevated;
+   * `always` forces the elevated path; `never` always spawns directly.
    */
-  private async resolveServicePlan(): Promise<{ useService: boolean }> {
+  private async resolveElevationPlan(): Promise<{ useElevation: boolean }> {
     const mode = this.options.elevation ?? 'auto';
     if (process.platform !== 'win32') {
-      if (mode === 'service') {
-        throw new Error("elevation: 'service' requires Windows and the OpenVPN interactive service");
+      if (mode === 'always') {
+        throw new Error("elevation: 'always' requires Windows and UAC");
       }
-      return { useService: false };
+      return { useElevation: false };
     }
-    if (mode === 'never') return { useService: false };
-
-    const client = this.serviceClient;
-    if (!client?.startOpenVpn) {
-      if (mode === 'service') {
-        throw new Error('the configured service client does not implement startOpenVpn()');
-      }
-      return { useService: false };
-    }
-
-    if (mode === 'service') return { useService: true };
-    if (await this.detectElevated()) return { useService: false };
-
-    if (typeof client.isAvailable === 'function') {
-      try {
-        if (!(await client.isAvailable())) return { useService: false };
-      } catch {
-        return { useService: false };
-      }
-    }
-    return { useService: true };
+    if (mode === 'never') return { useElevation: false };
+    if (mode === 'always') return { useElevation: true };
+    return { useElevation: !(await this.detectElevated()) };
   }
 
   private async detectElevated(): Promise<boolean> {
@@ -343,81 +279,71 @@ export class OpenVpnClient extends EventEmitter {
         return false;
       }
     }
-    return false;
+    return probeElevation();
   }
 
-  private async writeConfig(useService: boolean): Promise<void> {
+  /** Write the profile into the per-connection temp directory. */
+  private async writeConfig(): Promise<void> {
     const tempDir = this.tempDir;
     if (!tempDir) throw new Error('temporary directory was not created');
 
-    const directory =
-      useService && this.options.serviceConfigDir !== undefined
-        ? path.resolve(this.options.serviceConfigDir)
-        : tempDir;
-    if (directory !== tempDir) {
-      try {
-        await mkdir(directory, { recursive: true });
-      } catch (err) {
-        throw new Error(
-          `cannot create serviceConfigDir "${directory}": ${err instanceof Error ? err.message : String(err)}. ` +
-            'The interactive service only accepts profiles under its config_dir; choose a writable directory there or run elevated.',
-          { cause: err },
-        );
-      }
-    }
-
-    const file = path.join(directory, `openvpn-sdk-${process.pid}-${randomBytes(6).toString('hex')}.ovpn`);
+    const file = path.join(tempDir, `openvpn-sdk-${process.pid}-${randomBytes(6).toString('hex')}.ovpn`);
     await writeFile(file, this.configText, 'utf8');
     this.configFile = file;
-    this.configOutsideTemp = directory !== tempDir;
   }
 
-  private async startViaService(args: string[]): Promise<ServiceOpenVpnProcessLike> {
-    const client = this.serviceClient;
-    if (!client?.startOpenVpn) {
-      throw new Error('the configured service client does not implement startOpenVpn()');
-    }
+  /** Start OpenVPN through the elevated helper (UAC). */
+  private async startViaElevation(binary: string, args: string[]): Promise<ElevatedProcessLike> {
+    const configFile = this.configFile;
+    if (configFile === null) throw new Error('the OpenVPN profile was not written');
     // Use the profile directory so relative file references inside the profile
     // (ca/cert/key/tls-auth) resolve next to the profile, like a normal OpenVPN
     // launch from that directory.
-    const workingDirectory =
-      this.configFile !== null ? path.dirname(this.configFile) : this.tempDir;
-    if (!workingDirectory) throw new Error('temporary directory was not created');
-
+    const workingDirectory = path.dirname(configFile);
     try {
-      return await client.startOpenVpn({
-        workingDirectory,
-        options: buildWindowsCommandLine(args),
-        stdin: '',
-        timeoutMs: this.options.serviceStartTimeoutMs ?? 15_000,
-      });
+      return await this.getBroker().spawn(binary, args, { cwd: workingDirectory });
     } catch (err) {
-      throw await this.decorateServiceError(err);
+      if (err instanceof ElevationError) throw err;
+      throw new ElevationError(
+        `failed to start OpenVPN with administrator rights: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
     }
   }
 
-  /** Add actionable remediation to service startup failures. */
-  private async decorateServiceError(err: unknown): Promise<Error> {
-    const error = err instanceof Error ? err : new Error(String(err));
-    if (!(err instanceof OpenvpnServiceError)) return error;
+  /** Lazily create the UAC broker shared by the adapter and process paths. */
+  private getBroker(): ElevatedBrokerLike {
+    if (this.broker === null) {
+      this.broker = this.options.broker ?? new ElevatedBroker();
+      this.brokerOwned = this.options.broker === undefined;
+    }
+    return this.broker;
+  }
 
-    if (err.errorNumber === SERVICE_ERROR_STARTUP_DATA) {
-      let hint =
-        ' The interactive service rejected the startup data; non-admin users may only use profiles under the service config_dir.';
-      const settings = await readOpenvpnServiceSettings().catch(() => null);
-      if (settings?.configDir) {
-        const group = settings.adminGroup ?? 'OpenVPN Administrators';
-        hint = ` The interactive service accepts profiles only under "${settings.configDir}" unless the user is a member of "${group}". ` +
-          'Pass `serviceConfigDir` (a writable directory inside config_dir) or run elevated.';
+  private async runElevatedTapctl(file: string, args: string[]): Promise<TapctlExecResult> {
+    const result = await this.getBroker().run(file, args);
+    return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
+  }
+
+  private async disposeBroker(): Promise<void> {
+    const broker = this.broker;
+    this.broker = null;
+    if (broker !== null && this.brokerOwned) {
+      try {
+        await broker.dispose();
+      } catch {
+        // Best effort: the helper exits when the socket closes.
       }
-      error.message = `${error.message}.${hint}`;
     }
-    return error;
+    this.brokerOwned = false;
   }
 
-  private serviceErrorSuffix(): string {
-    const lastError = this.serviceProcess?.lastError;
-    return lastError ? `: ${lastError}` : '';
+  private childOutputSuffix(): string {
+    const child = this.child as (SpawnedProcess & { getStdout?(): string; getStderr?(): string }) | null;
+    const stdout = child?.getStdout?.() ?? this.processManager.getStdout?.() ?? '';
+    const stderr = child?.getStderr?.() ?? this.processManager.getStderr?.() ?? '';
+    const details = [stderr.trim(), stdout.trim()].filter(Boolean).join(' ');
+    return details === '' ? '' : `: ${details}`;
   }
 
   private async abortConnect(): Promise<void> {
@@ -428,15 +354,17 @@ export class OpenVpnClient extends EventEmitter {
       try {
         await this.processManager.killTree(child.pid);
       } catch {
-        // Best effort: the process may already be gone.
+        // Best effort: the process may already be gone (elevated children
+        // cannot be killed by the unelevated parent).
       }
-      if (this.launchedViaService && child.exitCode === null) {
-        this.serviceProcess?.kill();
+      if (child.exitCode === null) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Already gone.
+        }
       }
     }
-    this.serviceProcess?.close();
-    this.serviceProcess = null;
-    this.launchedViaService = false;
 
     if (this.management) {
       await this.management.disconnect();
@@ -453,6 +381,7 @@ export class OpenVpnClient extends EventEmitter {
     }
 
     await this.cleanup();
+    await this.disposeBroker();
   }
 
   waitFor(state: OvpnStateName, timeoutMs = 30_000): Promise<void> {
@@ -498,12 +427,9 @@ export class OpenVpnClient extends EventEmitter {
     if (!child) {
       // The process may have exited on its own (the exit handler cleared
       // `child`), but the management client and adapter may still be open.
-      if (this.management === null && this.serviceProcess === null && this.createdAdapterGuid === null) {
+      if (this.management === null && this.broker === null && this.createdAdapterGuid === null) {
         return;
       }
-      this.serviceProcess?.close();
-      this.serviceProcess = null;
-      this.launchedViaService = false;
       if (this.management) {
         await this.management.disconnect();
         this.management = null;
@@ -517,6 +443,7 @@ export class OpenVpnClient extends EventEmitter {
         this.createdAdapterGuid = null;
       }
       await this.cleanup();
+      await this.disposeBroker();
       this.emit('disconnected');
       return;
     }
@@ -545,14 +472,15 @@ export class OpenVpnClient extends EventEmitter {
       } catch {
         // The process may have exited between the check and taskkill.
       }
-      if (this.launchedViaService && this.isChildRunning()) {
-        this.serviceProcess?.kill();
+      if (this.isChildRunning()) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Already gone.
+        }
       }
     }
 
-    this.serviceProcess?.close();
-    this.serviceProcess = null;
-    this.launchedViaService = false;
 
     if (this.management) {
       await this.management.disconnect();
@@ -567,6 +495,7 @@ export class OpenVpnClient extends EventEmitter {
       this.createdAdapterGuid = null;
     }
     await this.cleanup();
+    await this.disposeBroker();
     this.emit('disconnected');
   }
 
@@ -643,11 +572,7 @@ export class OpenVpnClient extends EventEmitter {
       const onExit = (code: number | null, signal: string | null) => {
         if (settled) return;
         settled = true;
-        const serviceError = this.serviceProcess?.lastError ?? '';
-        const stderr = this.processManager.getStderr?.() ?? '';
-        const stdout = this.processManager.getStdout?.() ?? '';
-        const details = [serviceError.trim(), stderr.trim(), stdout.trim()].filter(Boolean).join(' ');
-        reject(new Error(`openvpn exited before the management socket became ready (code=${code}, signal=${signal})${details ? `: ${details}` : ''}`));
+        reject(new Error(`openvpn exited before the management socket became ready (code=${code}, signal=${signal})${this.childOutputSuffix()}`));
       };
       child.once('exit', onExit);
       wait().then(
@@ -683,20 +608,9 @@ export class OpenVpnClient extends EventEmitter {
   private async doCleanup(): Promise<void> {
     this.child = null;
     const dir = this.tempDir;
-    const configFile = this.configFile;
-    const configOutsideTemp = this.configOutsideTemp;
     this.tempDir = null;
     this.configFile = null;
-    this.configOutsideTemp = false;
-    this.serviceLogFile = null;
 
-    if (configOutsideTemp && configFile !== null) {
-      try {
-        await rm(configFile, { force: true });
-      } catch {
-        // Ignore: the profile may be held briefly by OpenVPN.
-      }
-    }
     if (!dir) return;
     try {
       await rm(dir, { recursive: true, force: true });
@@ -728,8 +642,9 @@ export interface ClientConnectEvent {
  */
 export class OpenVpnServer extends OpenVpnClient {
   constructor(config: OvpnConfig | string, options: OpenVpnClientOptions = {}) {
-    // Server profiles use options such as --management-client-auth that are not
-    // on the interactive-service whitelist, so default to a direct spawn.
+    // A server needs administrator rights for its adapter/routes anyway and is
+    // usually run from an elevated service, so it does not prompt for UAC by
+    // default. Pass `elevation: 'auto'` to opt into the elevated helper.
     super(config, options.elevation === undefined ? { ...options, elevation: 'never' } : options);
   }
 
@@ -796,30 +711,24 @@ export {
 } from '@ovpn-sdk/process';
 export {
   AdapterManager,
-  DEFAULT_SERVICE_PIPE,
-  INTERACTIVE_SERVICE_NAME,
-  OpenvpnServiceClient,
-  OpenvpnServiceError,
-  OpenvpnServiceProtocolError,
-  OpenvpnServiceStartError,
-  OpenvpnServiceUnavailableError,
-  SERVICE_ERROR_OPENVPN_STARTUP,
-  SERVICE_ERROR_STARTUP_DATA,
-  ServiceOpenVpnProcess,
+  ElevatedBroker,
+  ElevatedProcess,
+  ElevationCancelledError,
+  ElevationError,
+  ElevationUnavailableError,
   decodeTapctl,
-  describeServiceError,
-  encodeStartupData,
-  parseStartupResponse,
-  readOpenvpnServiceSettings,
+  isElevated,
+  parseAdapterList,
+  parseWin32ErrorCode,
   type AdapterInfo,
   type AdapterManagerLike,
-  type AdapterServiceMode,
-  type OpenvpnServiceClientLike,
-  type OpenvpnServiceClientOptions,
-  type OpenvpnServiceLauncherLike,
-  type OpenvpnServiceSettings,
-  type OpenvpnStartOptions,
-  type ServiceOpenVpnProcessLike,
+  type ElevatedBrokerLike,
+  type ElevatedCommandOptions,
+  type ElevatedCommandResult,
+  type ElevatedLaunchOptions,
+  type ElevatedProcessLike,
+  type TapctlExec,
+  type TapctlExecResult,
   type TapctlOptions,
 } from '@ovpn-sdk/tap';
 export { ManagementClient, type ManagementClientOptions } from '@ovpn-sdk/core';

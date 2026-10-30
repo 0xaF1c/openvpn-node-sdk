@@ -90,6 +90,8 @@ async function main() {
   const client = new OpenVpnClient(config, {
     binary: binary.path,
     manageAdapter: false,
+    // The smoke test uses a dev-null profile and must not prompt for UAC.
+    elevation: 'never',
     connectTimeoutMs: timeoutMs,
     disconnectTimeoutMs: 10_000,
     credentials: async () => ({ username: 'playground', password: 'playground' }),

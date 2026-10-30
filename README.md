@@ -1,8 +1,8 @@
 # openvpn-node-sdk
 
 Node.js SDK for OpenVPN: binary distribution, management-interface control,
-Windows adapter and elevation management through `tapctl.exe` /
-`OpenVPNServiceInteractive`, and server-side client-auth decisions.
+Windows adapter and UAC elevation through `tapctl.exe`, and server-side
+client-auth decisions.
 
 ## Installation
 
@@ -39,12 +39,14 @@ await vpn.waitFor('CONNECTED', 30_000);
 await vpn.disconnect();
 ```
 
-On Windows, `connect()` automatically goes through the OpenVPN interactive
-service (`OpenVPNServiceInteractive`) when the process is not elevated and the
-service is running. No UAC prompt is involved. See
-[Windows elevation through openvpnserv](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-openvpnserv.md)
-for the authorization model (profile location / `OpenVPN Administrators`), the
-`elevation` option and troubleshooting.
+On Windows, `connect()` requests administrator rights with a **UAC prompt** when
+the current process is not elevated. The SDK starts a small elevated helper
+(`elevate-helper.js`), which creates the adapter with `tapctl.exe` and runs
+`openvpn.exe` as administrator; a random-token loopback channel carries the
+commands, output and exit codes. No Windows service is used. If the prompt is
+declined, `connect()` rejects with `ElevationCancelledError`. See
+[Windows elevation (UAC)](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-elevation.md)
+for the elevation modes, standalone `ElevatedBroker` usage and troubleshooting.
 
 ## Quick start — server
 
@@ -92,17 +94,12 @@ new OpenVpnClient(config: OvpnConfig | string, options?: OpenVpnClientOptions)
 | `adapterHwid` | `'auto'` / `'ovpn-dco'` / `'root\\tap0901'` / `'tap0901'` | `'auto'` | Preferred adapter driver. |
 | `connectTimeoutMs` | `number` | `15000` | Management socket wait timeout. |
 | `disconnectTimeoutMs` | `number` | `5000` | Graceful shutdown timeout. |
-| `registerDns` | `boolean` | `false` | Pass `--register-dns`; not supported in service mode (use the profile directive). |
+| `registerDns` | `boolean` | `false` | Pass `--register-dns`. |
 | `extraArgs` | `string[]` | — | Extra raw OpenVPN args. |
 | `processManager` | `ProcessManagerLike` | `ProcessManager` | Injectable process manager. |
 | `adapterManager` | `AdapterManagerLike` | `AdapterManager` | Injectable adapter manager. |
-| `adapterServiceMode` | `'auto'` / `'always'` / `'never'` | `'auto'` | Adapter creation through `tapctl` vs the interactive service. |
-| `elevation` | `'auto'` / `'service'` / `'never'` | `'auto'` | Windows: `auto` uses `openvpnserv` for non-elevated processes; `service` forces it; `never` always spawns directly. |
-| `servicePipe` | `string` | `\\.\pipe\openvpn\service` | Interactive-service pipe override. |
-| `serviceClient` | `OpenvpnServiceLauncherLike` | `OpenvpnServiceClient` | Injectable service client (tests/custom transports). |
-| `serviceConfigDir` | `string` | — | Writable directory for the generated profile in service mode; must be inside the service `config_dir` for non-admin users. |
-| `serviceLog` | `boolean` | `true` | In service mode, pass `--log <temp>\openvpn-service.log` and append its tail to launch errors. |
-| `serviceStartTimeoutMs` | `number` | `15000` | Time for the service to return the new OpenVPN pid. |
+| `elevation` | `'auto'` / `'always'` / `'never'` | `'auto'` | Windows: `auto` shows a UAC prompt when the process is not elevated; `always` forces the elevated helper; `never` always spawns directly. |
+| `broker` | `ElevatedBrokerLike` | `ElevatedBroker` | Injectable UAC broker (tests/custom elevation). |
 | `isElevated` | `() => Promise<boolean>` | `AdapterManager.isElevated()` | Injectable elevation probe used by `elevation: 'auto'`. |
 
 ### Properties
@@ -118,7 +115,7 @@ new OpenVpnClient(config: OvpnConfig | string, options?: OpenVpnClientOptions)
 
 | Method | Description |
 |---|---|
-| `connect(): Promise<void>` | Start OpenVPN (directly or through `openvpnserv`), wait for the management socket, run the handshake. |
+| `connect(): Promise<void>` | Start OpenVPN (directly or through the elevated helper), wait for the management socket, run the handshake. |
 | `disconnect(): Promise<void>` | `signal SIGTERM` → wait for exit → force kill → cleanup. |
 | `waitFor(state, timeoutMs?): Promise<void>` | Resolve when the tunnel reaches a state. |
 | `sendManagement(cmd, opts?): Promise<MgmtCommandResult>` | Send a raw management command. |
@@ -148,8 +145,8 @@ new OpenVpnClient(config: OvpnConfig | string, options?: OpenVpnClientOptions)
 
 Server-side controller. Extends `OpenVpnClient`; add `--management-client-auth`
 via `extraArgs` and listen for `client-connect`. It defaults to
-`elevation: 'never'` because server options are not on the interactive-service
-whitelist.
+`elevation: 'never'` because a server normally runs as an elevated service and
+must not pop a UAC prompt; pass `elevation: 'auto'` to opt in.
 
 ### Methods
 
@@ -222,66 +219,58 @@ Exports: `getPlatformPackageName(platform?, arch?)`, `parseOpenVpnVersion(output
 
 ## `AdapterManager` (Windows)
 
-Wraps `tapctl.exe` and falls back to the elevated OpenVPN interactive service.
+Wraps `tapctl.exe`. The binary has a `requireAdministrator` manifest, so an
+unelevated process cannot start it at all; pass an `elevatedExec` runner (for
+example `(file, args) => broker.run(file, args)`) and the manager re-runs
+`list`/`create`/`delete` through the elevated helper when `tapctl` reports
+win32 740.
 
 | Method | Description |
 |---|---|
 | `list(hwid?): Promise<AdapterInfo[]>` | Enumerate adapters (`GUID/name/hwid`). |
-| `create({ name?, hwid? }): Promise<AdapterInfo>` | Create an adapter; falls back to the service on win32 740. |
-| `delete(guidOrName): Promise<void>` | Delete an adapter. |
-| `ensure({ hwid? }): Promise<AdapterInfo | null>` | Reuse or create; uses `openvpnserv` proactively for non-elevated processes and on win32 740. |
-| `release(guidOrName): Promise<void>` | Ref-counted release/delete (skips empty service keys). |
+| `create({ name?, hwid? }): Promise<AdapterInfo>` | Create an adapter; retries through `elevatedExec` on win32 740. |
+| `delete(guidOrName): Promise<void>` | Delete an adapter (elevated fallback). |
+| `ensure({ hwid? }): Promise<AdapterInfo | null>` | Reuse or create; retries through `elevatedExec` on win32 740. |
+| `release(guidOrName): Promise<void>` | Ref-counted release/delete. |
 | `isElevated(): Promise<boolean>` | `net session` check. |
 
-Options: `binary`, `exec`, `serviceClient`, and `serviceMode`
-(`'auto' | 'always' | 'never'`).
+Options: `binary`, `exec`, and `elevatedExec`.
 
-A service-created adapter has no name/GUID from the protocol, so it is returned
-as `{ guid: '', name: '', hwid, viaService: true }` when `tapctl list` also
-requires elevation. `OpenVpnClient` then omits `dev-node` and lets OpenVPN pick
-the first matching adapter; such adapters are not deleted automatically.
+`OpenVpnClient` wires `elevatedExec` to its `ElevatedBroker` automatically and
+injects `dev-node` when the adapter has a name.
 
 Exports: `decodeTapctl(buf)`, `parseAdapterList(text)`,
-`parseWin32ErrorCode(stderr)`, `TapctlError`, `ERROR_ELEVATION_REQUIRED`,
-`ADAPTER_TYPE_DCO`, `ADAPTER_TYPE_TAP`.
+`parseWin32ErrorCode(stderr)`, `TapctlError`, `ERROR_ELEVATION_REQUIRED`.
 
-See [Windows elevation through openvpnserv](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-openvpnserv.md)
-for the authorization rules, adapter persistence and troubleshooting.
+See [Windows elevation (UAC)](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-elevation.md)
+for the elevation model, standalone broker usage and troubleshooting.
 
-## `OpenvpnServiceClient` (Windows)
+## `ElevatedBroker` (Windows)
 
-Full client for the OpenVPN interactive service (`OpenVPNServiceInteractive`,
-`openvpnserv.exe`). It is used automatically by `AdapterManager` and by
-`OpenVpnClient` (via `elevation`), and can be used directly.
+On-demand UAC helper: starts `elevate-helper.js` with
+`powershell Start-Process -Verb RunAs`, authenticates it with a random token
+over a loopback socket, and executes privileged commands. One prompt per broker
+instance (one per `connect()`).
 
 ```ts
-const svc = new OpenvpnServiceClient();
+const broker = new ElevatedBroker();
+try {
+  const result = await broker.run('C:\\Program Files\\OpenVPN\\bin\\tapctl.exe', ['list']);
+  console.log(result.stdout.toString());
 
-if (!(await svc.isAvailable())) throw new Error('interactive service not running');
-
-await svc.createAdapter(0); // 0 = DCO, 1 = TAP; resolves to the Win32 error number
-
-const child = await svc.startOpenVpn({
-  workingDirectory: process.cwd(),
-  options: buildWindowsCommandLine(['--config', profilePath, '--management', '127.0.0.1', '5555']),
-  stdin: '',
-});
-child.on('exit', (code) => console.log(code, child.lastError));
+  const child = await broker.spawn(openvpnPath, ['--config', profile]);
+  child.on('exit', (code) => console.log(code, child.getStderr()));
+} finally {
+  await broker.dispose();
+}
 ```
 
-The service starts its configured `exe_path` (registry
-`HKLM\SOFTWARE\OpenVPN\exe_path`), not the SDK's `binary`, and appends
-`--msg-channel` itself. Adapter creation through the service requires a
-service build with `msg_create_adapter` (OpenVPN 2.6+). Process brokering is
-available in 2.4+.
+Options: `handshakeTimeoutMs` (default 120 s), `commandTimeoutMs` (30 s),
+`helperPath`, `nodePath`, `launch`.
 
-Also exported: `readOpenvpnServiceSettings()` (reads `exe_path`,
-`config_dir`, `ovpn_admin_group`, ... from the registry), `ServiceOpenVpnProcess`,
-the protocol helpers (`encodeHeader`, `decodeHeader`,
-`encodeCreateAdapterMessage`, `decodeAck`, `headerSize`, `encodeStartupData`,
-`parseStartupResponse`, `parseServiceErrorText`) and the error classes
-`OpenvpnServiceError`, `OpenvpnServiceUnavailableError`,
-`OpenvpnServiceStartError`, `OpenvpnServiceProtocolError`.
+Also exported: `isElevated()`, `ElevatedProcess`, `ElevationError`,
+`ElevationCancelledError`, `ElevationUnavailableError`, and the
+`ElevatedBrokerLike` / `ElevatedProcessLike` / `ElevatedCommandResult` types.
 
 ## `ManagementClient` / `ManagementServer` (core)
 
@@ -335,7 +324,7 @@ Events on `ManagementClient`: `notify`, `state`, `log`, `bytecount`,
 | `OvpnByteCount` | `{ inBytes, outBytes }` |
 | `MgmtCommandResult` | `{ success?, error?, lines: string[] }` |
 | `PkSignRequest` | `{ base64Data, data: Buffer, algorithm: string | null }` |
-| `AdapterInfo` | `{ guid, name, hwid, viaService? }` |
+| `AdapterInfo` | `{ guid, name, hwid }` |
 | `ResolvedBinary` | `{ path, source, version? }` |
 | `ParsedStatus` | `{ clients: StatusClient[], routes: StatusRoute[], raw }` |
 | `OpenVpnCredentials` | `{ username, password }` |
@@ -481,8 +470,8 @@ npm run playground:offline  # check + config + mock, chained
 npm run playground:check    # environment / resolution / API surface report
 npm run playground:smoke    # real binary, dev-null config (--dry-run to preview)
 npm run playground:connect -- --config <profile.ovpn>
-npm run playground:adapters list        # Windows; create/delete uses tapctl or openvpnserv
-npm run playground:service              # Windows; interactive-service pipe and registry report
+npm run playground:adapters list        # Windows; create/delete uses tapctl (UAC when needed)
+npm run playground:elevate              # Windows; UAC helper report (--run whoami to test)
 ```
 
 Offline scenarios run anywhere; the real-binary ones need an OpenVPN

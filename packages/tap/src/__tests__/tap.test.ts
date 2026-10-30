@@ -6,6 +6,7 @@ import {
   decodeTapctl,
   parseAdapterList,
   parseWin32ErrorCode,
+  type TapctlExec,
   type TapctlExecResult,
 } from '../index.ts';
 
@@ -18,9 +19,14 @@ function wide(s: string): Buffer {
   return Buffer.from(s, 'utf16le');
 }
 
-function fakeExec(script: Array<{ args: string[]; result: TapctlExecResult }>): { exec: (binary: string, args: string[]) => Promise<TapctlExecResult>; calls: string[][] } {
+interface Step {
+  args: string[];
+  result: TapctlExecResult;
+}
+
+function fakeExec(script: Step[]): { exec: TapctlExec; calls: string[][] } {
   const calls: string[][] = [];
-  const exec = async (binary: string, args: string[]): Promise<TapctlExecResult> => {
+  const exec: TapctlExec = async (_binary, args) => {
     calls.push(args);
     const hit = script.find((s) => JSON.stringify(s.args) === JSON.stringify(args));
     if (hit) return hit.result;
@@ -28,6 +34,13 @@ function fakeExec(script: Array<{ args: string[]; result: TapctlExecResult }>): 
   };
   return { exec, calls };
 }
+
+const ELEVATION_ERROR: TapctlExecResult = {
+  stdout: Buffer.alloc(0),
+  stderr: Buffer.alloc(0),
+  exitCode: 1,
+  spawnError: 'EACCES',
+};
 
 describe('decodeTapctl', () => {
   it('decodes UTF-16LE wide output', () => {
@@ -82,7 +95,7 @@ describe('AdapterManager with injected exec', () => {
       { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: wide('{new}' + TAB + 'created' + TAB + 'ovpn-dco' + NL), stderr: Buffer.alloc(0), exitCode: 0 } },
       { args: ['delete', '{new}'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } },
     ]);
-    const mgr = new AdapterManager({ exec, serviceMode: 'never' });
+    const mgr = new AdapterManager({ exec });
     const adapter = await mgr.ensure({ hwid: 'ovpn-dco' });
     assert.equal(adapter?.guid, '{new}');
     await mgr.release('{new}');
@@ -100,111 +113,86 @@ describe('AdapterManager with injected exec', () => {
     assert.equal(adapter?.hwid, ROOT_TAP);
   });
 
-  it('ensure falls back to openvpnserv when tapctl needs elevation (740)', async () => {
-    const { exec } = fakeExec([
-      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
-      { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
-    ]);
-    const serviceClient = {
-      calls: [] as number[],
-      async createAdapter(adapterType: number): Promise<number> {
-        this.calls.push(adapterType);
-        return 0;
-      },
-    };
-    const mgr = new AdapterManager({ exec, serviceClient });
-    const adapter = await mgr.ensure({ hwid: 'ovpn-dco' });
-    assert.equal(adapter?.viaService, true);
-    assert.equal(adapter?.hwid, 'ovpn-dco');
-    assert.deepEqual(serviceClient.calls, [0]);
-  });
-
-  it('uses the interactive service directly when serviceMode is always', async () => {
-    const { exec, calls } = fakeExec([
-      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } },
-    ]);
-    const service = {
-      available: true,
-      calls: [] as number[],
-      async isAvailable() {
-        return this.available;
-      },
-      async createAdapter(adapterType: number) {
-        this.calls.push(adapterType);
-        return 0;
-      },
-    };
-    const mgr = new AdapterManager({ exec, serviceClient: service, serviceMode: 'always' });
-    const adapter = await mgr.ensure({ hwid: 'ovpn-dco' });
-    assert.equal(adapter?.viaService, true);
-    assert.deepEqual(service.calls, [0]);
-    assert.equal(calls.some((c) => c[0] === 'create'), false);
-  });
-
-  it('create falls back to the service on elevation error', async () => {
-    const { exec } = fakeExec([
-      { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
-    ]);
-    const service = {
-      async createAdapter() {
-        return 0;
-      },
-    };
-    const mgr = new AdapterManager({ exec, serviceClient: service });
-    const adapter = await mgr.create({ hwid: 'ovpn-dco' });
-    assert.equal(adapter.viaService, true);
-    assert.equal(adapter.name, '');
-  });
-
-  it('tries the next driver when a service create fails', async () => {
-    const { exec } = fakeExec([
-      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } },
-    ]);
-    const service = {
-      calls: [] as number[],
-      async isAvailable() {
+  it('treats a tapctl spawn EACCES as win32 740', async () => {
+    const { exec } = fakeExec([{ args: ['list'], result: ELEVATION_ERROR }]);
+    const mgr = new AdapterManager({ exec });
+    await assert.rejects(
+      () => mgr.list(),
+      (err: unknown) => {
+        assert.ok(err instanceof TapctlError);
+        assert.equal(err.win32Code, 0x2e4);
+        assert.match(err.message, /requires elevation/);
         return true;
       },
-      async createAdapter(adapterType: number) {
-        this.calls.push(adapterType);
-        return adapterType === 0 ? 1 : 0;
-      },
-    };
-    const mgr = new AdapterManager({ exec, serviceClient: service, serviceMode: 'always' });
-    const adapter = await mgr.ensure();
-    assert.equal(adapter?.hwid, ROOT_TAP);
-    assert.deepEqual(service.calls, [0, 1]);
+    );
   });
 
-  it('does not call the service when serviceMode is never', async () => {
-    const { exec } = fakeExec([
-      { args: ['list'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
-      { args: ['create', '--hwid', 'ovpn-dco'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x2e4' + NL), exitCode: 1 } },
+  it('ensure re-runs list/create through elevatedExec when tapctl needs elevation', async () => {
+    const local = fakeExec([
+      { args: ['list'], result: ELEVATION_ERROR },
     ]);
-    const service = {
-      called: false,
-      async createAdapter() {
-        this.called = true;
-        return 0;
-      },
+    const elevatedCalls: string[][] = [];
+    const elevatedExec: TapctlExec = async (_binary, args) => {
+      elevatedCalls.push(args);
+      if (args[0] === 'list') {
+        return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
+      }
+      if (args[0] === 'create') {
+        return { stdout: wide('{elevated}' + TAB + 'elevated tap' + TAB + 'ovpn-dco' + NL), stderr: Buffer.alloc(0), exitCode: 0 };
+      }
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
     };
-    const mgr = new AdapterManager({ exec, serviceClient: service, serviceMode: 'never' });
-    await assert.rejects(() => mgr.ensure({ hwid: 'ovpn-dco' }), /unable to create a TAP adapter/);
-    assert.equal(service.called, false);
+
+    const mgr = new AdapterManager({ exec: local.exec, elevatedExec });
+    const adapter = await mgr.ensure({ hwid: 'ovpn-dco' });
+    assert.equal(adapter?.guid, '{elevated}');
+    assert.equal(adapter?.name, 'elevated tap');
+    assert.deepEqual(elevatedCalls, [
+      ['list'],
+      ['create', '--hwid', 'ovpn-dco'],
+    ]);
   });
 
-  it('ignores empty adapter release keys', async () => {
-    const { exec, calls } = fakeExec([]);
-    const mgr = new AdapterManager({ exec, serviceMode: 'never' });
-    await mgr.release('');
-    assert.equal(calls.length, 0);
+  it('create falls back to elevatedExec on an elevation error', async () => {
+    const local = fakeExec([{ args: ['create', '--hwid', 'ovpn-dco'], result: ELEVATION_ERROR }]);
+    const elevatedCalls: string[][] = [];
+    const elevatedExec: TapctlExec = async (_binary, args) => {
+      elevatedCalls.push(args);
+      return { stdout: wide('{admin}' + TAB + 'admin tap' + TAB + 'ovpn-dco' + NL), stderr: Buffer.alloc(0), exitCode: 0 };
+    };
+    const mgr = new AdapterManager({ exec: local.exec, elevatedExec });
+    const adapter = await mgr.create({ hwid: 'ovpn-dco' });
+    assert.equal(adapter.guid, '{admin}');
+    assert.deepEqual(elevatedCalls, [['create', '--hwid', 'ovpn-dco']]);
+  });
+
+  it('delete and release fall back to elevatedExec', async () => {
+    const local = fakeExec([{ args: ['delete', '{a}'], result: ELEVATION_ERROR }]);
+    const elevatedCalls: string[][] = [];
+    const elevatedExec: TapctlExec = async (_binary, args) => {
+      elevatedCalls.push(args);
+      return { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 };
+    };
+    const mgr = new AdapterManager({ exec: local.exec, elevatedExec });
+    await mgr.release('{a}');
+    assert.deepEqual(elevatedCalls, [['delete', '{a}']]);
+  });
+
+  it('does not elevate when no elevatedExec is configured', async () => {
+    const local = fakeExec([{ args: ['list'], result: ELEVATION_ERROR }]);
+    const mgr = new AdapterManager({ exec: local.exec });
+    await assert.rejects(() => mgr.ensure({ hwid: 'ovpn-dco' }), (err: unknown) => {
+      assert.ok(err instanceof TapctlError);
+      assert.equal(err.win32Code, 0x2e4);
+      return true;
+    });
   });
 
   it('surfaces reboot-required and win32 codes via TapctlError', async () => {
     const { exec } = fakeExec([
       { args: ['create', '--hwid', 'tap0901'], result: { stdout: Buffer.alloc(0), stderr: Buffer.from('error 0x20' + NL + 'A system reboot is required.' + NL), exitCode: 1 } },
     ]);
-    const mgr = new AdapterManager({ exec, serviceMode: 'never' });
+    const mgr = new AdapterManager({ exec });
     await assert.rejects(
       () => mgr.create({ hwid: 'tap0901' }),
       (err: unknown) => {
@@ -214,5 +202,11 @@ describe('AdapterManager with injected exec', () => {
         return true;
       },
     );
+  });
+
+  it('isElevated uses `net session` through the injected exec', async () => {
+    const { exec } = fakeExec([{ args: ['session'], result: { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), exitCode: 0 } }]);
+    const mgr = new AdapterManager({ exec });
+    assert.equal(await mgr.isElevated(), true);
   });
 });

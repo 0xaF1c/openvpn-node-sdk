@@ -17,9 +17,9 @@ this folder is pointless — the scripts resolve packages from the repo root.)
 | `npm run playground:check` | no | no | Environment self-check: node/platform, package resolution, public API surface, binary sources, bundled platform package, argv preview, config builder. |
 | `npm run playground:config` | no | no | Build a client `.ovpn` (inline CA/cert/key) and write it to disk (`--out <path>` keeps it). |
 | `npm run playground:smoke` | yes | no | Spawn the real binary with a throwaway `dev null` config, release `--management-hold`, confirm a state notification and a `pid` round trip, then disconnect. `--dry-run` prints the config/argv without spawning. |
-| `npm run playground:connect` | yes | Windows: no, when the interactive service handles it | Bring up a real tunnel from your own profile: `-- --config <profile.ovpn> [--user u] [--pass p]`. |
-| `npm run playground:adapters` | yes (`tapctl`) | Windows: no for `ensure` via service; yes for direct `tapctl` | `list` / `ensure [--hwid auto|ovpn-dco|tap0901]` / `release <guid-or-name>`. |
-| `npm run playground:service` | no | no | Windows: report OpenVPNServiceInteractive pipe availability and the `HKLM\SOFTWARE\OpenVPN` settings used by service-mode launches. |
+| `npm run playground:connect` | yes | Windows: yes (one UAC prompt, unless the shell is elevated or `--elevation never`) | Bring up a real tunnel from your own profile: `-- --config <profile.ovpn> [--user u] [--pass p] [--elevation auto\|always\|never]`. |
+| `npm run playground:adapters` | yes (`tapctl`) | Windows: yes for `list`/`ensure`/`release` unless the shell is elevated (one UAC prompt) | `list` / `ensure [--hwid auto\|ovpn-dco\|tap0901]` / `release <guid-or-name>`. |
+| `npm run playground:elevate` | no | only with `--test` | Windows: report the UAC helper (`node`, helper path, current elevation). `-- --test` approves a prompt and runs `whoami /groups` elevated. |
 
 `npm run playground:offline` chains the three offline scenarios (`check`,
 `config`, `mock`).
@@ -30,11 +30,11 @@ this folder is pointless — the scripts resolve packages from the repo root.)
 - `playground:smoke` / `playground:connect` need an OpenVPN binary; the Windows
   x64 platform package in this repo already bundles one (2.7.5). Otherwise set
   `OPENVPN_BINARY` (and `TAPCTL_BINARY` for adapters).
-- On Windows, `playground:connect` uses the OpenVPN interactive service
-  automatically when the shell is not elevated (unless the profile uses
-  `dev null`). Non-admin users must use a profile under the service
-  `config_dir` or be in `OpenVPN Administrators`; see
-  [Windows elevation through openvpnserv](../docs/windows-openvpnserv.md).
+- On Windows, `playground:connect` requests administrator rights with a UAC
+  prompt when the shell is not elevated (`--elevation auto`, the default). The
+  SDK starts an elevated helper, which creates the adapter and runs
+  `openvpn.exe` as administrator. Pass `--elevation never` to spawn directly.
+  See [Windows elevation (UAC)](../docs/windows-elevation.md).
 
 ## Exit codes
 
@@ -51,9 +51,9 @@ this folder is pointless — the scripts resolve packages from the repo root.)
   `client.sendManagement('hold release')`).
 - `AdapterManager` spawns `tapctl.exe` from `PATH` unless you pass a binary. The
   adapters scenario resolves it through `BinaryManager.resolveTapctl()` first.
-  When that fails with win32 740, the SDK asks the interactive service to
-  create the adapter instead; service-created adapters have no name/GUID and
-  are not deleted on `--release`.
+  `tapctl.exe` requires administrator rights; when the shell is not elevated the
+  SDK runs it through the elevated helper (one UAC prompt) instead of failing
+  with win32 740.
 - In confined sandboxes (and some CI runners) spawning a child with piped stdio
   fails with `EPERM`. The scenarios detect this and exit with code 2 instead of
   reporting a failure.

@@ -38,6 +38,7 @@ ${bold('playground:connect')} — connect to a real OpenVPN server
 
   npm run playground:connect -- --config <profile.ovpn> [--user <name>] [--pass <secret>]
                                  [--timeout <ms>] [--hold <ms>] [--no-adapter]
+                                 [--elevation auto|always|never]
 
   --config   path to an .ovpn profile (or PG_OVPN_CONFIG)
   --user     username for auth-user-pass (or PG_OVPN_USER)
@@ -45,8 +46,9 @@ ${bold('playground:connect')} — connect to a real OpenVPN server
   --timeout  how long to wait for CONNECTED (default 60000)
   --hold     how long to stay connected after CONNECTED (default 5000)
   --no-adapter  do not manage a TAP/DCO adapter (Windows only; also used for 'dev null' profiles)
+  --elevation   UAC strategy: auto (default), always, never
 
-${dim('On Windows, real tunnels need an elevated shell or the OpenVPN interactive service.')}`);
+${dim('On Windows, connect() shows one UAC prompt and runs OpenVPN as administrator (elevation: auto).')}`);
 }
 
 async function holdFor(ms) {
@@ -84,9 +86,13 @@ async function main() {
 
   const options = {
     manageAdapter: process.platform === 'win32' && !args.has('no-adapter'),
+    elevation: args.get('elevation', 'auto'),
     connectTimeoutMs,
     disconnectTimeoutMs: 10_000,
   };
+  if (options.elevation !== 'never' && process.platform === 'win32') {
+    reporter.info('elevation: a UAC prompt will appear (once) unless this shell is already elevated');
+  }
   if (username && password) {
     options.credentials = async () => ({ username, password });
   }

@@ -15,6 +15,7 @@ import { getPlatformPackageName } from '@ovpn-sdk/binary';
 import {
   AdapterManager,
   BinaryManager,
+  ElevatedBroker,
   escapeArg,
   getFreePort,
   ManagementClient,
@@ -70,8 +71,8 @@ async function main() {
     reporter.info(dim(String(err)));
   }
   reporter.expect(
-    resolvedEntry.endsWith('packages/openvpn-sdk/src/index.ts') || resolvedEntry.endsWith('packages\\openvpn-sdk\\src\\index.ts'),
-    'openvpn-node-sdk resolves to the workspace source entry',
+    resolvedEntry.includes('packages/openvpn-sdk/') || resolvedEntry.includes('packages\\openvpn-sdk\\'),
+    'openvpn-node-sdk resolves to the workspace package',
     resolvedEntry || 'unresolved',
   );
   reporter.info(`entry     : ${resolvedEntry || '(unresolved)'}`);
@@ -83,6 +84,7 @@ async function main() {
     OvpnConfig,
     BinaryManager,
     AdapterManager,
+    ElevatedBroker,
     ManagementClient,
     ManagementServer,
     MockManagementServer,

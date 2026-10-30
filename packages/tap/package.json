@@ -1,7 +1,7 @@
 {
   "name": "@ovpn-sdk/tap",
   "version": "0.1.0",
-  "description": "Windows adapter management (tapctl.exe + OpenVPN interactive service)",
+  "description": "Windows adapter management (tapctl.exe) and on-demand UAC elevation helper",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",

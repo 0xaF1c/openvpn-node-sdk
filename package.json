@@ -23,7 +23,7 @@
     "playground:smoke": "node playground/scripts/smoke.mjs",
     "playground:connect": "node playground/scripts/connect.mjs",
     "playground:adapters": "node playground/scripts/adapters.mjs",
-    "playground:service": "node playground/scripts/service.mjs",
+    "playground:elevate": "node playground/scripts/elevate.mjs",
     "playground:offline": "node playground/scripts/check.mjs && node playground/scripts/config.mjs && node playground/scripts/mock-flow.mjs",
     "verify:packages": "node scripts/verify-platform-packages.mjs --no-exec",
     "prepare:release": "node scripts/prepare-release.mjs",

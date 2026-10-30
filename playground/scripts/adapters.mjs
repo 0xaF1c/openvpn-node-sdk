@@ -6,11 +6,11 @@
  *   npm run playground:adapters ensure [--hwid auto|ovpn-dco|tap0901] [--name <name>] [--release]
  *   npm run playground:adapters release <guid-or-name>
  *
- * Non-Windows hosts exit with code 2. Adapters are created by tapctl.exe when
- * the shell is elevated; otherwise the SDK asks the OpenVPN interactive
- * service (OpenVPNServiceInteractive) to create them.
+ * Non-Windows hosts exit with code 2. `tapctl.exe` requires administrator
+ * rights, so when the shell is not elevated the first command shows a UAC
+ * prompt and the operation runs through the elevated helper.
  */
-import { AdapterManager, BinaryManager } from 'openvpn-node-sdk';
+import { AdapterManager, BinaryManager, ElevatedBroker, ElevationError } from 'openvpn-node-sdk';
 import { bold, dim, EXIT_FAIL, EXIT_SKIP, isSpawnBlocked, parseArgs, Reporter, spawnBlockedHint, yellow } from './lib.mjs';
 
 const args = parseArgs();
@@ -26,7 +26,7 @@ ${bold('playground:adapters')} — Windows adapter management
   npm run playground:adapters ensure [--hwid auto|ovpn-dco|tap0901] [--name <name>] [--release]
   npm run playground:adapters release <guid-or-name>
 
-${dim('Needs Windows. create/delete uses tapctl when elevated, otherwise openvpnserv.')}`);
+${dim('Needs Windows. tapctl.exe requires administrator rights, so an unelevated shell gets one UAC prompt.')}`);
 }
 
 function resolveTapctl() {
@@ -42,16 +42,11 @@ function describeError(err) {
     const parts = [err.message];
     if (err.win32Code !== null && err.win32Code !== undefined) parts.push(`win32=${err.win32Code} (0x${Number(err.win32Code).toString(16)})`);
     if (err.rebootRequired) parts.push('a reboot is required before the adapter becomes usable');
-    if (err.win32Code === 740) parts.push('elevation required: run from an elevated shell or use the interactive service');
+    if (err.win32Code === 740) parts.push('elevation required: approve the UAC prompt or run from an elevated shell');
     return parts.join('\n');
   }
-  if (typeof err?.name === 'string' && err.name.startsWith('OpenvpnService')) {
-    const parts = [err.message];
-    if (typeof err.errorNumber === 'number' && err.errorNumber !== 0) {
-      parts.push(`win32=0x${err.errorNumber.toString(16)}`);
-    }
-    if (err.stage) parts.push(`stage=${err.stage}`);
-    return parts.join('\n');
+  if (err instanceof ElevationError) {
+    return `${err.name}: ${err.message}`;
   }
   return err instanceof Error ? err.stack ?? err.message : String(err);
 }
@@ -70,7 +65,12 @@ async function main() {
   } else {
     reporter.warn('tapctl not resolved; falling back to `tapctl.exe` on PATH');
   }
-  const adapters = new AdapterManager(binary ? { binary } : {});
+
+  const broker = new ElevatedBroker();
+  const adapters = new AdapterManager({
+    ...(binary === undefined ? {} : { binary }),
+    elevatedExec: (file, argv) => broker.run(file, argv),
+  });
 
   let elevated = false;
   try {
@@ -78,8 +78,8 @@ async function main() {
   } catch (err) {
     reporter.warn(`elevation check failed: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (elevated) reporter.ok('running elevated (direct tapctl create/delete)');
-  else reporter.warn('not elevated: adapter creation will go through OpenVPNServiceInteractive; deletion may still need elevation');
+  if (elevated) reporter.ok('running elevated: tapctl runs directly');
+  else reporter.warn('not elevated: tapctl runs through the elevated helper (UAC prompt on first use)');
 
   try {
     if (command === 'list') {
@@ -98,17 +98,12 @@ async function main() {
       const adapter = await adapters.ensure({ hwid, name: args.get('name') });
       reporter.expect(adapter !== null, `adapter ready (hwid=${hwid})`);
       if (!adapter) return reporter.summary();
-      reporter.info(`guid: ${adapter.guid || '(via service)'}`);
-      reporter.info(`name: ${adapter.name || '(via service)'}`);
-      reporter.info(`hwid: ${adapter.hwid}${adapter.viaService ? ' (created by the interactive service)' : ''}`);
-      if (adapter.viaService) reporter.warn('created by openvpnserv: no name is returned and it may not be deletable without elevation');
+      reporter.info(`guid: ${adapter.guid || '(unknown)'}`);
+      reporter.info(`name: ${adapter.name || '(unknown)'}`);
+      reporter.info(`hwid: ${adapter.hwid}`);
       if (args.has('release')) {
-        if (!adapter.guid && !adapter.name) {
-          reporter.skip('nothing to release: the service did not return an adapter identity');
-        } else {
-          await adapters.release(adapter.guid || adapter.name);
-          reporter.ok('adapter released (deleted when the last reference was dropped)');
-        }
+        await adapters.release(adapter.guid || adapter.name);
+        reporter.ok('adapter released (deleted when the last reference was dropped)');
       }
       return reporter.summary();
     }
@@ -135,6 +130,8 @@ async function main() {
     }
     reporter.fail('adapter operation failed', describeError(err));
     return reporter.summary();
+  } finally {
+    await broker.dispose();
   }
 }
 
