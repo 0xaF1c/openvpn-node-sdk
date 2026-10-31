@@ -153,6 +153,23 @@ describe('AdapterManager with injected exec', { skip: process.platform !== 'win3
     ]);
   });
 
+  it('list falls back to elevatedExec on an elevation error', async () => {
+    const local = fakeExec([{ args: ['list'], result: ELEVATION_ERROR }]);
+    const elevatedCalls: string[][] = [];
+    const elevatedExec: TapctlExec = async (_binary, args) => {
+      elevatedCalls.push(args);
+      return {
+        stdout: wide('{elevated}' + TAB + 'elevated tap' + TAB + 'ovpn-dco' + NL),
+        stderr: Buffer.alloc(0),
+        exitCode: 0,
+      };
+    };
+    const mgr = new AdapterManager({ exec: local.exec, elevatedExec });
+    const adapters = await mgr.list();
+    assert.equal(adapters[0]?.name, 'elevated tap');
+    assert.deepEqual(elevatedCalls, [['list']]);
+  });
+
   it('create falls back to elevatedExec on an elevation error', async () => {
     const local = fakeExec([{ args: ['create', '--hwid', 'ovpn-dco'], result: ELEVATION_ERROR }]);
     const elevatedCalls: string[][] = [];

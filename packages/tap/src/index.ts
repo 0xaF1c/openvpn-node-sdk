@@ -136,7 +136,14 @@ export class AdapterManager {
   }
 
   async list(hwid?: string): Promise<AdapterInfo[]> {
-    return this.listWith(this.exec, hwid);
+    try {
+      return await this.listWith(this.exec, hwid);
+    } catch (err) {
+      // `tapctl list` cannot even be spawned unelevated (win32 740/spawn
+      // EACCES), so retry through the broker just like create/delete.
+      if (!isElevationError(err) || this.elevatedExec === null) throw err;
+      return this.listWith(this.elevatedExec, hwid);
+    }
   }
 
   private async listWith(exec: TapctlExec, hwid?: string): Promise<AdapterInfo[]> {
@@ -253,7 +260,9 @@ export class AdapterManager {
   }
 
   async isElevated(): Promise<boolean> {
-    if (process.platform !== 'win32') return true;
+    if (process.platform !== 'win32') {
+      return typeof process.getuid === 'function' ? process.getuid() === 0 : true;
+    }
     const result = await this.exec('net', ['session']);
     return result.exitCode === 0;
   }
@@ -285,7 +294,10 @@ function isElevationError(err: unknown): boolean {
   return err instanceof TapctlError && err.win32Code === ERROR_ELEVATION_REQUIRED;
 }
 
-export type AdapterManagerLike = Pick<AdapterManager, 'ensure' | 'release'> & {
+export type AdapterManagerLike = Pick<
+  AdapterManager,
+  'ensure' | 'release' | 'list' | 'create'
+> & {
   /** Optional elevation probe used by `OpenVpnClient`'s `elevation: 'auto'`. */
   isElevated?(): Promise<boolean>;
 };
@@ -300,6 +312,7 @@ export {
   buildElevatedLaunchCommand,
   isElevated,
   quoteWindowsArgument,
+  resolveElevationHelperPath,
   type ElevatedBrokerLike,
   type ElevatedBrokerOptions,
   type ElevatedCommandOptions,
@@ -307,4 +320,5 @@ export {
   type ElevatedLaunchCommand,
   type ElevatedLaunchOptions,
   type ElevatedProcessLike,
+  type ElevationHelperResolutionOptions,
 } from './elevate.ts';

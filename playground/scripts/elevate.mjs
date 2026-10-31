@@ -5,6 +5,7 @@
  *   npm run playground:elevate                        # report only (no UAC prompt)
  *   npm run playground:elevate -- --test              # prompt for UAC and run `whoami /groups`
  *   npm run playground:elevate -- --launcher <path>   # report/use a branded launcher
+ *   npm run playground:elevate -- --helper <path>     # report/use an explicit helper file
  *
  * The helper is only started on demand, so the report itself never prompts.
  * Non-Windows hosts exit with code 2.
@@ -17,6 +18,7 @@ import { bold, dim, EXIT_FAIL, EXIT_SKIP, parseArgs, Reporter } from './lib.mjs'
 const cli = parseArgs();
 const args = process.argv.slice(2);
 const launcherPath = cli.get('launcher');
+const explicitHelperPath = cli.get('helper');
 const reporter = new Reporter('playground:elevate');
 
 function describeError(err) {
@@ -43,9 +45,18 @@ async function main() {
   }
 
   reporter.section('helper');
-  const broker = new ElevatedBroker(
-    launcherPath === undefined ? {} : { launcherPath: path.resolve(launcherPath) },
-  );
+  let broker;
+  try {
+    broker = new ElevatedBroker({
+      ...(explicitHelperPath === undefined ? {} : { helperPath: path.resolve(explicitHelperPath) }),
+      ...(launcherPath === undefined ? {} : { launcherPath: path.resolve(launcherPath) }),
+    });
+  } catch (err) {
+    // The SDK resolves the helper eagerly and throws when it cannot be found.
+    reporter.fail('the elevation helper could not be resolved', describeError(err));
+    reporter.info(dim('point the SDK at an existing file: npm run playground:elevate -- --helper <path>'));
+    return reporter.summary();
+  }
   reporter.info(`helper script: ${broker.helperPath}`);
   reporter.expect(existsSync(broker.helperPath), 'elevation helper is present');
   reporter.info(`node for the helper: ${broker.nodePath}`);

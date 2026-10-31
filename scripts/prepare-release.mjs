@@ -23,7 +23,20 @@ const dryRun = process.argv.includes('--dry-run');
 const SDK_PACKAGE_FILE = path.join(SDK_PACKAGE_DIR, 'package.json');
 const ENTRY_JS = 'dist/openvpn-sdk/src/index.js';
 const ENTRY_DTS = 'dist/openvpn-sdk/src/index.d.ts';
-const REQUIRED_OUTPUTS = [ENTRY_JS, ENTRY_DTS, 'vendor/openvpn.json'];
+/**
+ * Elevation helper entry points. `elevate-helper.mjs` is the one hosts should
+ * use (always parsed as an ES module, even when `asarUnpack`ed); the `.js` copy
+ * is kept for build scripts that already reference it.
+ */
+const ELEVATION_HELPER_MJS = 'dist/tap/src/elevate-helper.mjs';
+const ELEVATION_HELPER_JS = 'dist/tap/src/elevate-helper.js';
+const REQUIRED_OUTPUTS = [
+  ENTRY_JS,
+  ENTRY_DTS,
+  ELEVATION_HELPER_MJS,
+  ELEVATION_HELPER_JS,
+  'vendor/openvpn.json',
+];
 /** npm only includes README/LICENSE that sit inside the package directory. */
 const DOC_FILES = ['README.md', 'LICENSE'];
 
@@ -78,7 +91,15 @@ function main() {
     ...rest,
     main: `./${ENTRY_JS}`,
     types: `./${ENTRY_DTS}`,
-    exports: { '.': { types: `./${ENTRY_DTS}`, import: `./${ENTRY_JS}` } },
+    exports: {
+      '.': { types: `./${ENTRY_DTS}`, import: `./${ENTRY_JS}` },
+      // Lets hosts (and the SDK's own resolver) locate the elevation helper with
+      // `import.meta.resolve` / `require.resolve`, independent of the dist layout.
+      './elevate-helper': `./${ELEVATION_HELPER_MJS}`,
+      // Needed to resolve the package root (helper lookup fallback) and read
+      // package metadata from host tooling.
+      './package.json': './package.json',
+    },
     files: ['dist', 'vendor'],
     dependencies: {},
     publishConfig: { ...(pkg.publishConfig ?? {}), access: 'public' },

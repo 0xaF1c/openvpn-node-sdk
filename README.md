@@ -40,21 +40,31 @@ await vpn.disconnect();
 ```
 
 On Windows, `connect()` requests administrator rights with a **UAC prompt** when
-the current process is not elevated. The SDK starts a small elevated helper
-(`elevate-helper.js`), which creates the adapter with `tapctl.exe` and runs
-`openvpn.exe` as administrator; a random-token loopback channel carries the
-commands, output and exit codes. No Windows service is used. If the prompt is
-declined, `connect()` rejects with `ElevationCancelledError`. See
+the current process is not elevated; on macOS/Linux it uses the native
+`osascript` / `pkexec` prompt. The SDK starts a small elevated helper
+(`elevate-helper.mjs`) through that platform API, which creates the adapter with
+`tapctl.exe` (Windows) and runs `openvpn.exe` with the elevated token; a
+random-token loopback channel carries the commands, output and exit codes. No
+Windows service is used. If the prompt is declined, `connect()` rejects with
+`ElevationCancelledError`. See
 [Windows elevation (UAC)](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-elevation.md)
 for the elevation modes, standalone `ElevatedBroker` usage and troubleshooting.
+
+The helper path is resolved automatically (next to the SDK module, then through
+the installed `openvpn-node-sdk` package). Hosts that bundle the SDK into their
+own entry file (Electron main with Vite/Rollup/esbuild) can pass
+`elevationHelperPath` explicitly; if the helper cannot be found, `connect()`
+fails fast with `ElevationUnavailableError` instead of waiting for the handshake
+timeout. Electron packagers must keep the helper out of `app.asar`
+(`asarUnpack`).
 
 ### Platform support
 
 | Platform | Adapter management | Elevation |
 |---|---|---|
-| Windows | `tapctl.exe` through the UAC helper | UAC prompt (`elevation: 'auto'`, the default); brand it with `elevateLauncher` |
-| Linux | — (OpenVPN creates the tun/tap device) | run the process as root; `auto` spawns directly, `always` throws |
-| macOS | — | same as Linux |
+| Windows | `tapctl.exe` through the UAC helper | UAC prompt (`elevation: 'auto'`, the default); direct elevation of Node/the launcher, never cmd.exe |
+| Linux | — (OpenVPN creates the tun/tap device) | `elevation: 'auto'` prompts via `pkexec` when not root; run as root to skip the prompt; `always` forces the helper |
+| macOS | — | `elevation: 'auto'` prompts via `osascript` when not root; same modes as Linux |
 
 Management protocol negotiation is version-aware: OpenVPN 2.7+ advertises
 management version 6 and acknowledges `version 6`; OpenVPN 2.6 advertises
@@ -112,9 +122,10 @@ new OpenVpnClient(config: OvpnConfig | string, options?: OpenVpnClientOptions)
 | `extraArgs` | `string[]` | — | Extra raw OpenVPN args. |
 | `processManager` | `ProcessManagerLike` | `ProcessManager` | Injectable process manager. |
 | `adapterManager` | `AdapterManagerLike` | `AdapterManager` | Injectable adapter manager. |
-| `elevation` | `'auto'` / `'always'` / `'never'` | `'auto'` | Windows: `auto` shows a UAC prompt when the process is not elevated; `always` forces the elevated helper; `never` always spawns directly. |
+| `elevation` | `'auto'` / `'always'` / `'never'` | `'auto'` | `auto` prompts when the process is not elevated (UAC on Windows, `osascript`/`pkexec` on macOS/Linux); `always` forces the elevated helper; `never` always spawns directly. |
 | `broker` | `ElevatedBrokerLike` | `ElevatedBroker` | Injectable UAC broker (tests/custom elevation). |
-| `elevateLauncher` | `string` | — | Windows: branded launcher executable to elevate (controls the UAC icon/name/publisher). Build it with `scripts/build-elevate-launcher.ps1`. |
+| `elevateLauncher` | `string` | — | Windows: branded launcher executable to elevate (controls the UAC icon/name/publisher). Build it with `scripts/build-elevate-launcher.ps1`. Ignored on macOS/Linux. |
+| `elevationHelperPath` | `string` | auto | Absolute path to the elevation helper entry point; needed when a bundler inlined the SDK into the host bundle. Missing file fails fast with `ElevationUnavailableError`. `resolveElevationHelperPath()` returns the default. |
 | `isElevated` | `() => Promise<boolean>` | `AdapterManager.isElevated()` | Injectable elevation probe used by `elevation: 'auto'`. |
 
 ### Properties
@@ -260,12 +271,13 @@ Exports: `decodeTapctl(buf)`, `parseAdapterList(text)`,
 See [Windows elevation (UAC)](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-elevation.md)
 for the elevation model, standalone broker usage and troubleshooting.
 
-## `ElevatedBroker` (Windows)
+## `ElevatedBroker`
 
-On-demand UAC helper: starts `elevate-helper.js` with
-`powershell Start-Process -Verb RunAs`, authenticates it with a random token
-over a loopback socket, and executes privileged commands. One prompt per broker
-instance (one per `connect()`).
+On-demand privileged helper: starts `elevate-helper.mjs` through the platform
+elevation API (`Start-Process -Verb RunAs` on Windows, `osascript` on macOS,
+`pkexec` on Linux), authenticates it with a random token over a loopback socket,
+and executes privileged commands. One prompt per broker instance (one per
+`connect()`).
 
 ```ts
 const broker = new ElevatedBroker();
@@ -281,7 +293,16 @@ try {
 ```
 
 Options: `handshakeTimeoutMs` (default 120 s), `commandTimeoutMs` (30 s),
-`helperPath`, `nodePath`, `launcherPath`, `launch`.
+`helperPath` (defaults to `resolveElevationHelperPath()`), `nodePath`,
+`launcherPath`, `launch`.
+
+`resolveElevationHelperPath()` returns the absolute helper path and throws
+`ElevationUnavailableError` (listing every candidate) when the SDK is bundled in
+a way that leaves the helper unreachable. `ElevatedBroker` performs the same
+resolution in its constructor, so a missing helper fails immediately instead of
+after the 120 s handshake timeout. Electron packagers must keep the helper out of
+`app.asar`; see
+[Windows elevation (UAC)](https://github.com/0xaF1c/openvpn-node-sdk/blob/main/docs/windows-elevation.md#where-the-helper-lives-bundlers-and-packaged-apps).
 
 The UAC prompt's icon, program name and publisher come from the elevated
 executable. By default that is `node.exe`; build a branded launcher with
@@ -289,14 +310,20 @@ executable. By default that is `node.exe`; build a branded launcher with
 and pass `elevateLauncher` (or `launcherPath`) to show your own brand instead of
 "Node.js". The dialog title/body are drawn by Windows and cannot be changed.
 
-On Linux/macOS `elevation: 'auto'` spawns directly (no UAC helper), `isElevated()`
-checks uid 0, and `elevation: 'always'` throws `ElevationUnavailableError`; run
-the process as root (sudo/systemd) when OpenVPN needs a tun device or routes.
-Adapter management and `elevateLauncher`/`ElevatedBroker` are Windows-only.
+In an Electron host the default launcher automatically wraps the helper in an
+elevated PowerShell that sets `ELECTRON_RUN_AS_NODE=1`, so `process.execPath`
+(and the packaged app executable) can run the helper as Node. A custom
+`elevateLauncher` must do the same itself.
 
-Also exported: `isElevated()`, `ElevatedProcess`, `ElevationError`,
-`ElevationCancelledError`, `ElevationUnavailableError`, and the
-`ElevatedBrokerLike` / `ElevatedProcessLike` / `ElevatedCommandResult` types.
+On Linux/macOS `elevation: 'auto'` prompts through `pkexec`/`osascript` when the
+process is not root (it spawns directly when already root), and
+`elevation: 'always'` forces the helper. `isElevated()` checks uid 0. Adapter
+management and `elevateLauncher` are Windows-only.
+
+Also exported: `isElevated()`, `resolveElevationHelperPath()`, `ElevatedProcess`,
+`ElevationError`, `ElevationCancelledError`, `ElevationUnavailableError`, and the
+`ElevatedBrokerLike` / `ElevatedProcessLike` / `ElevatedCommandResult` /
+`ElevationHelperResolutionOptions` types.
 
 ## `ManagementClient` / `ManagementServer` (core)
 
@@ -497,7 +524,7 @@ npm run playground:check    # environment / resolution / API surface report
 npm run playground:smoke    # real binary, dev-null config (--dry-run to preview)
 npm run playground:connect -- --config <profile.ovpn>
 npm run playground:adapters list        # Windows; create/delete uses tapctl (UAC when needed)
-npm run playground:elevate              # Windows; UAC helper report (--run whoami to test)
+npm run playground:elevate              # Windows; UAC helper report (--test for a real prompt)
 ```
 
 Offline scenarios run anywhere; the real-binary ones need an OpenVPN

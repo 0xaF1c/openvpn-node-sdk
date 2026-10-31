@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { createServer, type AddressInfo, type Server, type Socket } from 'node:net';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -15,15 +17,17 @@ const execFileAsync = promisify(execFile);
  * privileges needed for a real tunnel, and `tapctl.exe` refuses to start at all
  * (its manifest requires administrator rights). The classic workaround was the
  * OpenVPN interactive service (`openvpnserv`); this module replaces it with an
- * on-demand UAC elevation: when elevation is needed, the SDK starts
- * {@link ./elevate-helper.ts} through `powershell Start-Process -Verb RunAs`.
+ * on-demand elevation: when elevation is needed, the SDK starts
+ * {@link ./elevate-helper.ts} through the platform's native consent UI
+ * (`Start-Process -Verb RunAs` on Windows, `osascript` on macOS, `pkexec` on
+ * Linux).
  * The helper runs as an administrator, connects back to the parent over a
  * loopback TCP socket protected by a random token, and executes the privileged
  * commands (`tapctl.exe`, `openvpn.exe`) on request.
  *
- * One UAC prompt is shown per broker instance. The broker is started lazily on
- * the first privileged operation and should be {@link ElevatedBroker.dispose}
- * when the connection is torn down.
+ * One elevation prompt is shown per broker instance. The broker is started
+ * lazily on the first privileged operation and should be
+ * {@link ElevatedBroker.dispose} when the connection is torn down.
  */
 
 /** Default time to wait for the user to approve UAC and the helper to connect. */
@@ -39,7 +43,7 @@ export class ElevationError extends Error {
   }
 }
 
-/** The user declined the UAC prompt, or PowerShell could not show it. */
+/** The user declined the elevation prompt, or the prompt could not be shown. */
 export class ElevationCancelledError extends ElevationError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -47,7 +51,7 @@ export class ElevationCancelledError extends ElevationError {
   }
 }
 
-/** Elevation is not supported in this environment (non-Windows, no PowerShell). */
+/** Elevation is not supported in this environment (no supported backend). */
 export class ElevationUnavailableError extends ElevationError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -121,7 +125,13 @@ export interface ElevatedBrokerOptions {
   handshakeTimeoutMs?: number;
   /** Timeout for a single command (default 30 s). */
   commandTimeoutMs?: number;
-  /** Helper entry point; defaults to `elevate-helper.js` next to this module. */
+  /**
+   * Helper entry point. Defaults to {@link resolveElevationHelperPath}, which
+   * finds the `elevate-helper` file shipped with the SDK (or installed inside
+   * `openvpn-node-sdk`). Set it when a bundler inlined the SDK into a host
+   * bundle and the helper lives somewhere else; a missing file throws
+   * `ElevationUnavailableError` instead of timing out after the UAC prompt.
+   */
   helperPath?: string;
   /** Node.js executable used for the helper (default `process.execPath`). */
   nodePath?: string;
@@ -133,10 +143,10 @@ export interface ElevatedBrokerOptions {
    * is the only way to brand it. The launcher is started as
    * `launcher <nodePath> <helperPath> --port <p> --token <t>` and must run
    * `nodePath` with the remaining arguments (see
-   * `scripts/build-elevate-launcher.ps1`).
+   * `scripts/build-elevate-launcher.ps1`). Ignored on macOS/Linux.
    */
   launcherPath?: string;
-  /** Injectable launcher (tests). Defaults to PowerShell `Start-Process -Verb RunAs`. */
+  /** Injectable launcher (tests). Defaults to the platform elevation backend. */
   launch?: (options: ElevatedLaunchOptions) => Promise<void>;
 }
 
@@ -196,6 +206,16 @@ function powerShellQuote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+/** Absolute Windows PowerShell path (PATH is not reliable after elevation). */
+function powerShellPath(): string {
+  const root = process.env.SystemRoot ?? 'C:\\Windows';
+  return `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+}
+
+function isElectronRuntime(): boolean {
+  return typeof process.versions.electron === 'string' && process.versions.electron !== '';
+}
+
 function describeLaunchFailure(err: unknown): string {
   const error = err as NodeJS.ErrnoException & { stderr?: unknown; stdout?: unknown };
   const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : '';
@@ -205,14 +225,218 @@ function describeLaunchFailure(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function defaultHelperPath(): string {
-  // Built packages ship `elevate-helper.js`; when the SDK is loaded from its
-  // TypeScript sources (tests/playground) the compiled file may not exist yet
-  // and Node can run the `.ts` entry directly (type stripping).
-  const compiled = fileURLToPath(new URL('./elevate-helper.js', import.meta.url));
-  if (existsSync(compiled)) return compiled;
-  const source = fileURLToPath(new URL('./elevate-helper.ts', import.meta.url));
-  return existsSync(source) ? source : compiled;
+/** Quote one argument for /bin/sh (used by macOS `do shell script`). */
+function shellQuote(value: string): string {
+  if (value === '') return "''";
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * File names the helper is shipped under, most portable first.
+ *
+ * - `.mjs`: the build copies the compiled helper to this name, because `.mjs`
+ *   is always parsed as an ES module. A `.js` copy (for example an
+ *   `asarUnpack`ed file without the package's `package.json` above it) would be
+ *   loaded as CommonJS and the helper would die with a syntax error.
+ * - `.js`: the `tsc` output shipped inside `dist/` since 0.1.0, kept so host
+ *   build scripts that copy `dist/tap/src/elevate-helper.js` keep working.
+ * - `.ts`: the TypeScript source, used when the SDK runs from sources
+ *   (tests/playground) and the compiled file does not exist yet. Node >= 22.18
+ *   runs it directly via type stripping.
+ */
+const HELPER_FILE_NAMES = ['elevate-helper.mjs', 'elevate-helper.js', 'elevate-helper.ts'] as const;
+
+/**
+ * Packages that ship the helper as an `exports` subpath. `openvpn-node-sdk` is
+ * the published bundle, `@ovpn-sdk/tap` the workspace package it is built from.
+ */
+const HELPER_PACKAGE_NAMES = ['openvpn-node-sdk', '@ovpn-sdk/tap'] as const;
+
+/** `exports` subpath both packages use for the helper entry point. */
+const HELPER_EXPORT_SUBPATH = 'elevate-helper';
+
+/** An `app.asar` path segment, as produced by an Electron packager. */
+const ASAR_SEGMENT = /([\\/])app\.asar([\\/])/;
+
+/** Options for {@link resolveElevationHelperPath}. */
+export interface ElevationHelperResolutionOptions {
+  /**
+   * Explicit helper entry point (`elevationHelperPath` on `OpenVpnClient`,
+   * `helperPath` on `ElevatedBroker`).
+   *
+   * Relative paths are resolved against the current working directory. When set,
+   * discovery is skipped and a missing file is an error instead of a silent
+   * fallback.
+   */
+  helperPath?: string;
+  /**
+   * URL (or path) of the module executing this code; defaults to
+   * `import.meta.url`.
+   *
+   * Bundlers replace `import.meta.url` with the host bundle's URL, which is
+   * exactly what the package-based lookup needs. Tests and hosts with a custom
+   * module loader can override the starting point.
+   */
+  moduleUrl?: string | URL;
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function toModuleUrl(value: string | URL): URL {
+  if (value instanceof URL) return value;
+  try {
+    return new URL(value);
+  } catch {
+    return pathToFileURL(resolve(value));
+  }
+}
+
+/**
+ * An Electron `app.asar` archive cannot be read by an elevated child process,
+ * so a candidate inside the archive is only usable through its `asarUnpack`ed
+ * sibling. Prefer that copy and fall back to the archive path, which
+ * {@link pickExistingHelper} rejects when it is the only one that exists.
+ */
+function unpackedVariants(candidate: string): string[] {
+  const match = ASAR_SEGMENT.exec(candidate);
+  if (match === null) return [candidate];
+  const unpacked = candidate.replace(ASAR_SEGMENT, `${match[1]}app.asar.unpacked${match[2]}`);
+  return [unpacked, candidate];
+}
+
+/** True for a path inside an Electron `app.asar` archive (not `app.asar.unpacked`). */
+function isArchivedPath(path: string): boolean {
+  if (typeof process.versions.electron !== 'string' || process.versions.electron === '') return false;
+  return ASAR_SEGMENT.test(path);
+}
+
+/**
+ * Layouts the helper can have inside an installed package: the published
+ * bundle nests the workspace packages under `dist/`, while the tap package
+ * emits next to its own `dist/` root, and a source checkout has `src/`.
+ */
+function installedHelperLayouts(packageRoot: string): string[] {
+  return [
+    join(packageRoot, 'dist', 'tap', 'src', 'elevate-helper.mjs'),
+    join(packageRoot, 'dist', 'tap', 'src', 'elevate-helper.js'),
+    join(packageRoot, 'dist', 'elevate-helper.mjs'),
+    join(packageRoot, 'dist', 'elevate-helper.js'),
+    join(packageRoot, 'src', 'elevate-helper.ts'),
+  ];
+}
+
+function formatCheckedLocations(checked: readonly string[]): string {
+  return checked.map((entry) => `  - ${entry}`).join('\n');
+}
+
+/** Return the first candidate that exists, recording every path that was tried. */
+function pickExistingHelper(candidates: readonly string[], checked: string[]): string | null {
+  for (const candidate of candidates) {
+    checked.push(candidate);
+    if (!isFile(candidate)) continue;
+    if (isArchivedPath(candidate)) {
+      throw new ElevationUnavailableError(
+        `the elevation helper ${candidate} is inside an app.asar archive, which an elevated child process cannot execute. ` +
+          'Unpack it (electron-builder: asarUnpack: ["node_modules/openvpn-node-sdk/dist/tap/src/elevate-helper.mjs"]), ' +
+          'or copy it outside the archive and pass its path as elevationHelperPath/helperPath',
+      );
+    }
+    return candidate;
+  }
+  return null;
+}
+
+/**
+ * Locate the elevated helper entry point (`elevate-helper.mjs`, `.js` or `.ts`).
+ *
+ * Resolution order:
+ * 1. an explicit `helperPath` — a missing file is an error, never a silent
+ *    fallback to a path that does not exist;
+ * 2. files next to the running module (`import.meta.url`), which covers the
+ *    published `dist/tap/src/` layout and the TypeScript sources;
+ * 3. the installed package root, found with `createRequire` from the running
+ *    module (`openvpn-node-sdk/elevate-helper`). This is what keeps working when
+ *    a bundler inlined the SDK into the host bundle: `import.meta.url` then
+ *    points at the *host* entry file, but Node's resolver still walks up to
+ *    `node_modules` and finds the installed package.
+ *
+ * Paths inside an Electron `app.asar` are mapped to `app.asar.unpacked` before
+ * use, and rejected when only the archive copy exists.
+ *
+ * @throws {ElevationUnavailableError} when no candidate exists. The message
+ * lists every path that was checked, so the caller can point the SDK at the
+ * right file with `elevationHelperPath`/`helperPath` instead of waiting for the
+ * 120 s handshake timeout after the UAC prompt.
+ */
+export function resolveElevationHelperPath(
+  options: ElevationHelperResolutionOptions = {},
+): string {
+  const checked: string[] = [];
+
+  const explicit = options.helperPath;
+  if (explicit !== undefined && explicit.trim() !== '') {
+    const absolute = resolve(explicit);
+    const found = pickExistingHelper(unpackedVariants(absolute), checked);
+    if (found !== null) return found;
+    throw new ElevationUnavailableError(
+      [
+        `the elevation helper was not found at ${absolute} (elevationHelperPath/helperPath). Checked:`,
+        formatCheckedLocations(checked),
+        'Pass the existing elevate-helper.js/.mjs file, or remove the option to let the SDK resolve it.',
+      ].join('\n'),
+    );
+  }
+
+  const moduleUrl = toModuleUrl(options.moduleUrl ?? import.meta.url);
+  const moduleDirectory = dirname(fileURLToPath(moduleUrl));
+  for (const name of HELPER_FILE_NAMES) {
+    const found = pickExistingHelper(unpackedVariants(join(moduleDirectory, name)), checked);
+    if (found !== null) return found;
+  }
+
+  const requireFromModule = createRequire(moduleUrl);
+  for (const packageName of HELPER_PACKAGE_NAMES) {
+    // Preferred: the documented subpath export (`openvpn-node-sdk/elevate-helper`).
+    const subpath = `${packageName}/${HELPER_EXPORT_SUBPATH}`;
+    try {
+      const resolved = requireFromModule.resolve(subpath);
+      const found = pickExistingHelper(unpackedVariants(resolved), checked);
+      if (found !== null) return found;
+    } catch (err) {
+      if (err instanceof ElevationUnavailableError) throw err;
+      checked.push(`${subpath} (not resolvable from ${moduleDirectory})`);
+    }
+
+    // Fallback: resolve the package root and derive the known dist layouts. This
+    // also works for manifests that do not export the subpath.
+    const manifestSpecifier = `${packageName}/package.json`;
+    try {
+      const manifest = requireFromModule.resolve(manifestSpecifier);
+      const found = pickExistingHelper(installedHelperLayouts(dirname(manifest)), checked);
+      if (found !== null) return found;
+    } catch (err) {
+      if (err instanceof ElevationUnavailableError) throw err;
+      checked.push(`${manifestSpecifier} (not resolvable from ${moduleDirectory})`);
+    }
+  }
+
+  throw new ElevationUnavailableError(
+    [
+      `cannot find the elevation helper (${HELPER_FILE_NAMES.join(', ')}). Checked:`,
+      formatCheckedLocations(checked),
+      'If a bundler inlined the SDK into your own build, pass the helper path explicitly:',
+      "  new OpenVpnClient(config, { elevationHelperPath: '<absolute path to elevate-helper.js>' })",
+      "  new ElevatedBroker({ helperPath: '<absolute path to elevate-helper.js>' })",
+      'Electron: the helper must live outside app.asar (asarUnpack); see docs/windows-elevation.md.',
+    ].join('\n'),
+  );
 }
 
 export interface ElevatedLaunchCommand {
@@ -225,13 +449,11 @@ export interface ElevatedLaunchCommand {
 }
 
 /**
- * Build the command used to start the elevated helper.
+ * Build the PowerShell `Start-Process -Verb RunAs` command used on Windows.
  *
- * Without a launcher the target is `node <helper> --port … --token …`.
- * With a launcher the target is `launcher <node> <helper> --port … --token …`;
- * the launcher just forwards the remaining arguments to `node`, which makes the
- * UAC consent dialog show the launcher's icon/name/publisher instead of
- * Node.js.
+ * The elevated executable is `nodePath` (or `launcherPath`), never `cmd.exe`;
+ * `-ArgumentList` is pre-quoted because Start-Process joins its array elements
+ * with spaces without quoting.
  */
 export function buildElevatedLaunchCommand(options: {
   nodePath: string;
@@ -254,15 +476,86 @@ export function buildElevatedLaunchCommand(options: {
   return { targetFile, targetArguments, powerShellScript };
 }
 
-async function defaultLaunch(options: ElevatedLaunchOptions): Promise<void> {
-  if (process.platform !== 'win32') {
-    throw new ElevationUnavailableError('UAC elevation is only available on Windows');
-  }
-  // `Start-Process -Verb RunAs` is the only UAC entry point available from
-  // pure Node.js. The arguments are pre-quoted because Start-Process joins
-  // `-ArgumentList` with spaces without quoting.
-  const { powerShellScript } = buildElevatedLaunchCommand(options);
+/**
+ * Electron variant of {@link buildElevatedLaunchCommand}.
+ *
+ * In an Electron host `process.execPath` is `electron.exe` (or the packaged
+ * app), not a standalone Node.js. UAC launches it without the caller's
+ * environment, so it would start a second GUI instance instead of the helper.
+ * Elevate a nested PowerShell that sets `ELECTRON_RUN_AS_NODE=1` before
+ * starting the target, which makes Electron behave like Node for the helper.
+ *
+ * The branded `launcherPath` is intentionally not used here: a custom launcher
+ * runs the target itself and is responsible for the Electron environment.
+ */
+export function buildElectronElevatedLaunchCommand(options: {
+  nodePath: string;
+  helperPath: string;
+  port: number;
+  token: string;
+}): ElevatedLaunchCommand {
+  const { targetFile, targetArguments } = buildElevatedLaunchCommand(options);
+  const innerScript = [
+    "$env:ELECTRON_RUN_AS_NODE = '1'",
+    `Start-Process -FilePath ${powerShellQuote(targetFile)}` +
+      ` -ArgumentList ${powerShellQuote(targetArguments)} -WindowStyle Hidden`,
+  ].join('\n');
+  const encoded = Buffer.from(innerScript, 'utf16le').toString('base64');
+  const innerArguments =
+    `-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}`;
+  const powerShellScript = [
+    `Start-Process -FilePath ${powerShellQuote(powerShellPath())}`,
+    `-ArgumentList ${powerShellQuote(innerArguments)}`,
+    '-Verb RunAs -WindowStyle Hidden',
+  ].join(' ');
+  return { targetFile, targetArguments, powerShellScript };
+}
 
+/**
+ * Build the /bin/sh command that runs the helper as root on macOS/Linux.
+ *
+ * `launcherPath` is a Windows-only branding feature and is ignored here.
+ */
+export function buildPosixLaunchCommand(options: ElevatedLaunchOptions): string {
+  return [
+    options.nodePath,
+    options.helperPath,
+    '--port',
+    String(options.port),
+    '--token',
+    options.token,
+  ].map(shellQuote).join(' ');
+}
+
+/** AppleScript string literal (backslashes and quotes escaped). */
+function appleScriptQuote(value: string): string {
+  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+}
+
+/**
+ * AppleScript that asks for administrator rights via `osascript` and runs the
+ * helper as root. `do shell script` waits for the helper to exit, so the
+ * broker's handshake (not this promise) decides when it is ready.
+ */
+export function buildAppleScriptLaunchCommand(options: ElevatedLaunchOptions): string {
+  return `do shell script ${appleScriptQuote(buildPosixLaunchCommand(options))} with administrator privileges`;
+}
+
+async function defaultLaunch(options: ElevatedLaunchOptions): Promise<void> {
+  if (process.platform === 'win32') return launchWindows(options);
+  if (process.platform === 'darwin') return launchMac(options);
+  if (process.platform === 'linux') return launchLinux(options);
+  throw new ElevationUnavailableError(`elevation is not supported on ${process.platform}`);
+}
+
+async function launchWindows(options: ElevatedLaunchOptions): Promise<void> {
+  // Elevate node.exe (or the branded launcher) directly; cmd.exe is never the
+  // elevated target. Electron hosts need the nested PowerShell wrapper so the
+  // helper runs with `ELECTRON_RUN_AS_NODE=1`.
+  const { powerShellScript } =
+    isElectronRuntime() && options.launcherPath === undefined
+      ? buildElectronElevatedLaunchCommand(options)
+      : buildElevatedLaunchCommand(options);
   try {
     await execFileAsync(
       'powershell.exe',
@@ -271,7 +564,6 @@ async function defaultLaunch(options: ElevatedLaunchOptions): Promise<void> {
     );
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    const detail = describeLaunchFailure(err);
     if (code === 'ENOENT') {
       throw new ElevationUnavailableError(
         'Windows PowerShell (powershell.exe) is required to request administrator rights but was not found',
@@ -279,7 +571,58 @@ async function defaultLaunch(options: ElevatedLaunchOptions): Promise<void> {
       );
     }
     throw new ElevationCancelledError(
-      `failed to start the elevated OpenVPN helper (the UAC prompt was cancelled or could not be shown): ${detail}`,
+      `failed to start the elevated OpenVPN helper (the UAC prompt was cancelled or could not be shown): ${describeLaunchFailure(err)}`,
+      { cause: err },
+    );
+  }
+}
+
+async function launchMac(options: ElevatedLaunchOptions): Promise<void> {
+  try {
+    await execFileAsync('osascript', ['-e', buildAppleScriptLaunchCommand(options)], { windowsHide: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      throw new ElevationUnavailableError(
+        'osascript is required to request administrator rights but was not found',
+        { cause: err },
+      );
+    }
+    throw new ElevationCancelledError(
+      `macOS administrator authorization failed (cancelled?): ${describeLaunchFailure(err)}`,
+      { cause: err },
+    );
+  }
+}
+
+async function launchLinux(options: ElevatedLaunchOptions): Promise<void> {
+  const args = [options.helperPath, '--port', String(options.port), '--token', options.token];
+  try {
+    await execFileAsync('pkexec', [options.nodePath, ...args], { windowsHide: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      throw new ElevationUnavailableError(
+        'pkexec (PolicyKit) is required to request administrator rights but was not found',
+        { cause: err },
+      );
+    }
+    const detail = describeLaunchFailure(err);
+    const numeric = typeof code === 'number' ? code : Number(code);
+    if (/no authentication agent/i.test(detail)) {
+      throw new ElevationUnavailableError(
+        `no PolicyKit authentication agent is available: ${detail}`,
+        { cause: err },
+      );
+    }
+    if (numeric === 126 || numeric === 127 || /not authorized|dismissed|cancel/i.test(detail)) {
+      throw new ElevationCancelledError(
+        `PolicyKit authorization was cancelled or denied: ${detail}`,
+        { cause: err },
+      );
+    }
+    throw new ElevationError(
+      `failed to start the elevated OpenVPN helper: ${detail}`,
       { cause: err },
     );
   }
@@ -400,7 +743,9 @@ export class ElevatedBroker implements ElevatedBrokerLike {
   constructor(options: ElevatedBrokerOptions = {}) {
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_ELEVATION_HANDSHAKE_TIMEOUT_MS;
     this.commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_ELEVATION_COMMAND_TIMEOUT_MS;
-    this.helperPath = options.helperPath ?? defaultHelperPath();
+    this.helperPath = resolveElevationHelperPath(
+      options.helperPath === undefined ? {} : { helperPath: options.helperPath },
+    );
     this.nodePath = options.nodePath ?? process.execPath;
     this.launcherPath = options.launcherPath;
     this.launch = options.launch ?? defaultLaunch;
@@ -532,7 +877,8 @@ export class ElevatedBroker implements ElevatedBrokerLike {
         this.handshake = null;
         reject(
           new ElevationError(
-            `the elevated helper did not connect back within ${this.handshakeTimeoutMs}ms (was the UAC prompt approved?)`,
+            `the elevated helper did not connect back within ${this.handshakeTimeoutMs}ms ` +
+              `(was the UAC prompt approved? helper: ${this.helperPath})`,
           ),
         );
       }, this.handshakeTimeoutMs);
@@ -555,13 +901,24 @@ export class ElevatedBroker implements ElevatedBrokerLike {
     void handshake.catch(() => {});
 
     try {
-      await this.launch({
+      const launch = this.launch({
         port: address.port,
         token: this.token,
         helperPath: this.helperPath,
         nodePath: this.nodePath,
         ...(this.launcherPath === undefined ? {} : { launcherPath: this.launcherPath }),
       });
+      // A successful launch may resolve immediately (Windows) or only when the
+      // helper exits (pkexec/osascript). Neither proves the helper is ready:
+      // the handshake does. Map success to a promise that never settles so the
+      // race below can only be won by the handshake, while an early launch
+      // failure (e.g. the UAC prompt was cancelled) still rejects promptly.
+      const launchFailure = launch.then(
+        () => new Promise<void>(() => {}),
+        (err) => Promise.reject(err),
+      );
+      void launchFailure.catch(() => {});
+      await Promise.race([handshake, launchFailure]);
       await handshake;
     } catch (err) {
       this.handshake?.reject(err instanceof Error ? err : new Error(String(err)));

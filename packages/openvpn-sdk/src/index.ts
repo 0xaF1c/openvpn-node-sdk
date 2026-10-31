@@ -33,7 +33,6 @@ import {
   AdapterManager,
   ElevatedBroker,
   ElevationError,
-  ElevationUnavailableError,
   isElevated as probeElevation,
   type AdapterManagerLike,
   type ElevatedBrokerLike,
@@ -41,7 +40,7 @@ import {
   type TapctlExecResult,
 } from '@ovpn-sdk/tap';
 
-/** Windows launch strategy for `OpenVpnClient`. */
+/** Elevation strategy for `OpenVpnClient`. */
 export type ElevationMode = 'auto' | 'always' | 'never';
 
 export interface OpenVpnCredentials {
@@ -73,32 +72,46 @@ export interface OpenVpnClientOptions {
   /** Injectable adapter manager (tests). */
   adapterManager?: AdapterManagerLike;
   /**
-   * Windows launch strategy (default `'auto'`):
-   * - `auto`: request administrator rights with a UAC prompt when the current
-   *   process is not elevated (and use the elevated helper for `tapctl` too);
+   * Elevation strategy (default `'auto'`):
+   * - `auto`: request administrator/root rights when the current process is not
+   *   elevated (UAC on Windows, `osascript` on macOS, `pkexec` on Linux; the
+   *   elevated helper also runs `tapctl` on Windows);
    * - `always`: always launch OpenVPN through the elevated helper;
    * - `never`: always spawn OpenVPN directly, even when not elevated.
    *
-   * The elevated helper runs `openvpn.exe` and `tapctl.exe` as administrator.
-   * One UAC prompt is shown per connection attempt; a declined prompt throws
-   * `ElevationCancelledError`. See `docs/windows-elevation.md`.
+   * One elevation prompt is shown per connection attempt; a declined prompt
+   * throws `ElevationCancelledError`. See `docs/windows-elevation.md`.
    */
   elevation?: ElevationMode;
   /**
-   * Injectable UAC broker (tests or a custom elevation backend). The client
-   * disposes a broker it created itself; an injected broker is owned by the
-   * caller and is never disposed.
+   * Injectable elevation broker (tests or a custom elevation backend). The
+   * client disposes a broker it created itself; an injected broker is owned by
+   * the caller and is never disposed.
    */
   broker?: ElevatedBrokerLike;
   /**
-   * Windows: branded launcher executable to elevate instead of Node.js.
+   * Windows: branded launcher executable to elevate instead of `nodePath`.
    *
-   * The UAC consent dialog shows the elevated executable's icon, program name
-   * (`FileDescription`) and publisher. Build one with
-   * `scripts/build-elevate-launcher.ps1` (optionally sign it with `signtool`)
-   * and point this option at it. Ignored when `broker` is provided.
+   * The UAC consent dialog shows the elevated executable's icon/name/publisher,
+   * so this is how to brand the prompt. Build one with
+   * `scripts/build-elevate-launcher.ps1`. Ignored on macOS/Linux.
    */
   elevateLauncher?: string;
+  /**
+   * Absolute path to the elevation helper entry point
+   * (`elevate-helper.mjs`/`.js`/`.ts`).
+   *
+   * By default the SDK resolves the helper next to its own module and then
+   * through the installed package (`openvpn-node-sdk/elevate-helper`). Set this
+   * when a bundler inlined the SDK into your own entry file (Electron main with
+   * Vite/Rollup/esbuild, single-file builds): `import.meta.url` then points at
+   * *your* bundle, and the installed package may not be resolvable at runtime.
+   * `resolveElevationHelperPath()` returns the path the SDK would use from an
+   * unbundled context. A path that does not exist fails fast with
+   * `ElevationUnavailableError` instead of a 120 s handshake timeout after the
+   * user approved UAC. See `docs/windows-elevation.md`.
+   */
+  elevationHelperPath?: string;
   /** Override the elevation probe used by `elevation: 'auto'` (tests). */
   isElevated?: () => Promise<boolean>;
 }
@@ -263,14 +276,6 @@ export class OpenVpnClient extends EventEmitter {
    */
   private async resolveElevationPlan(): Promise<{ useElevation: boolean }> {
     const mode = this.options.elevation ?? 'auto';
-    if (process.platform !== 'win32') {
-      if (mode === 'always') {
-        throw new ElevationUnavailableError(
-          "elevation: 'always' requires Windows and UAC; on Linux/macOS run the process as root (sudo, pkexec or a service) instead",
-        );
-      }
-      return { useElevation: false };
-    }
     if (mode === 'never') return { useElevation: false };
     if (mode === 'always') return { useElevation: true };
     return { useElevation: !(await this.detectElevated()) };
@@ -327,6 +332,11 @@ export class OpenVpnClient extends EventEmitter {
   private getBroker(): ElevatedBrokerLike {
     if (this.broker === null) {
       this.broker = this.options.broker ?? new ElevatedBroker({
+        // Forward the packaging overrides (bundled hosts); both default to the
+        // SDK's own discovery when unset.
+        ...(this.options.elevationHelperPath === undefined
+          ? {}
+          : { helperPath: this.options.elevationHelperPath }),
         ...(this.options.elevateLauncher === undefined
           ? {}
           : { launcherPath: this.options.elevateLauncher }),
@@ -737,6 +747,7 @@ export {
   isElevated,
   parseAdapterList,
   parseWin32ErrorCode,
+  resolveElevationHelperPath,
   type AdapterInfo,
   type AdapterManagerLike,
   type ElevatedBrokerLike,
@@ -745,6 +756,7 @@ export {
   type ElevatedCommandResult,
   type ElevatedLaunchOptions,
   type ElevatedProcessLike,
+  type ElevationHelperResolutionOptions,
   type TapctlExec,
   type TapctlExecResult,
   type TapctlOptions,

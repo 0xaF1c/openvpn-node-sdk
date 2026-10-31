@@ -17,6 +17,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { isReady, loadManifest, platformDir, ROOT, validateManifest } from './lib/openvpn-manifest.mjs';
+import { copyElevationHelperAsMjs } from './lib/elevation-helper.mjs';
 
 const SDK_DIR = path.join(ROOT, 'packages', 'openvpn-sdk');
 const OUT_DIR = path.join(SDK_DIR, 'dist');
@@ -43,18 +44,27 @@ function walk(dir, visit) {
   }
 }
 
-/** Rewrite `@ovpn-sdk/<pkg>` imports/exports to relative paths inside dist/. */
+/**
+ * Rewrite `@ovpn-sdk/<pkg>` imports/exports to relative paths inside dist/.
+ *
+ * Only real module specifiers are rewritten (`from '...'`, `import('...')`,
+ * `import '...'`). A bare package name in a string — for example the elevation
+ * helper resolver's candidate list — must stay a package name: rewriting it to a
+ * relative path would make the runtime lookup resolve relative to the file
+ * instead of through `node_modules`.
+ */
 function rewriteInternalSpecifiers() {
   let rewritten = 0;
+  const specifier = /(\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])@ovpn-sdk\/([a-z0-9-]+)\2/g;
   walk(OUT_DIR, (file) => {
     if (!file.endsWith('.js') && !file.endsWith('.d.ts')) return;
     const source = readFileSync(file, 'utf8');
-    const next = source.replace(/(['"])@ovpn-sdk\/([a-z0-9-]+)\1/g, (match, quote, name) => {
+    const next = source.replace(specifier, (match, prefix, quote, name) => {
       if (!INTERNAL_PACKAGES.has(name)) throw new Error(`unexpected internal package @ovpn-sdk/${name} in ${path.relative(ROOT, file)}`);
       const target = path.join(OUT_DIR, name, 'src', 'index.js');
       let relative = path.relative(path.dirname(file), target).split(path.sep).join('/');
       if (!relative.startsWith('.')) relative = `./${relative}`;
-      return `${quote}${relative}${quote}`;
+      return `${prefix}${quote}${relative}${quote}`;
     });
     if (next !== source) {
       writeFileSync(file, next);
@@ -135,6 +145,15 @@ function main() {
     throw new Error(`expected ${path.relative(ROOT, entry)} and index.d.ts to exist`);
   }
   console.log(`  entry: ${path.relative(ROOT, entry)}`);
+
+  // Ship the elevation helper as `.mjs` too: the resolver prefers it, and a
+  // `.mjs` copy keeps working when it is `asarUnpack`ed without a package.json
+  // above it (see scripts/lib/elevation-helper.mjs).
+  const helperMjs = copyElevationHelperAsMjs(path.join(OUT_DIR, 'tap', 'src', 'elevate-helper.js'));
+  if (helperMjs === null) {
+    throw new Error(`expected ${path.relative(ROOT, path.join(OUT_DIR, 'tap', 'src', 'elevate-helper.js'))} to exist`);
+  }
+  console.log(`  helper: ${path.relative(ROOT, helperMjs)}`);
 
   console.log('vendoring binaries');
   vendorBinaries(openvpn);

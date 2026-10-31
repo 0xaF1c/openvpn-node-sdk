@@ -10,7 +10,9 @@
     ".": {
       "types": "./dist/openvpn-sdk/src/index.d.ts",
       "import": "./dist/openvpn-sdk/src/index.js"
-    }
+    },
+    "./elevate-helper": "./dist/tap/src/elevate-helper.mjs",
+    "./package.json": "./package.json"
   },
   "dependencies": {},
   "publishConfig": {

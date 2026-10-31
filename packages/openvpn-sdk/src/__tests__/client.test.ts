@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { describe, it } from 'node:test';
 import { MockManagementServer } from '@ovpn-sdk/core';
 import { type ProcessManagerLike, type SpawnedProcess } from '@ovpn-sdk/process';
-import { readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -38,6 +38,14 @@ class FakeAdapterManager {
   readonly released: string[] = [];
   adapter = { guid: '{adapter-guid}', name: 'SDK TAP Adapter', hwid: 'ovpn-dco' };
   elevated = false;
+
+  async list(): Promise<Array<{ guid: string; name: string; hwid: string }>> {
+    return [this.adapter];
+  }
+
+  async create(): Promise<{ guid: string; name: string; hwid: string }> {
+    return this.adapter;
+  }
 
   async ensure(opts: { hwid?: string } = {}): Promise<{ guid: string; name: string; hwid: string }> {
     this.ensureCalls.push(opts);
@@ -375,7 +383,7 @@ describe('OpenVpnClient orchestration', () => {
     await server.stop();
   });
 
-  it('never starts the UAC broker on POSIX', { skip: isWindows && 'Windows uses the UAC helper' }, async () => {
+  it('uses the elevation broker on POSIX when not root', { skip: isWindows && 'Windows uses the UAC helper' }, async () => {
     const server = new MockManagementServer();
     const port = await server.start();
     const fakeManager = new FakeProcessManager();
@@ -391,24 +399,88 @@ describe('OpenVpnClient orchestration', () => {
       managementPort: port,
       disconnectTimeoutMs: 20,
       manageAdapter: false,
+      isElevated: async () => false,
     });
 
     await client.connect();
-    assert.equal(broker.spawned.length, 0);
-    assert.equal(fakeManager.started.length, 1);
+    assert.equal(broker.spawned.length, 1);
+    assert.equal(fakeManager.started.length, 0);
     await client.disconnect();
     await server.stop();
   });
 
-  it('rejects elevation: "always" with ElevationUnavailableError on POSIX', { skip: isWindows && 'Windows supports UAC' }, async () => {
+  it('uses the broker for elevation: "always" on POSIX', { skip: isWindows && 'Windows supports UAC' }, async () => {
+    const server = new MockManagementServer();
+    const port = await server.start();
+    const fakeManager = new FakeProcessManager();
+    const broker = new FakeBroker();
     const client = new OpenVpnClient('dev null\n', {
       binary: process.execPath,
-      managementPort: 1,
+      processManager: fakeManager,
+      broker,
+      managementHost: '127.0.0.1',
+      managementPort: port,
       disconnectTimeoutMs: 20,
       elevation: 'always',
       manageAdapter: false,
     });
-    await assert.rejects(() => client.connect(), ElevationUnavailableError);
+    await client.connect();
+    assert.equal(broker.spawned.length, 1);
+    assert.equal(fakeManager.started.length, 0);
+    await client.disconnect();
+    await server.stop();
+  });
+
+  it('forwards elevationHelperPath to the broker it creates', async () => {
+    // Bundled hosts (Electron + Vite/Rollup) must be able to point the SDK at
+    // the helper themselves; the option has to reach ElevatedBroker.helperPath.
+    const dir = await mkdtemp(path.join(tmpdir(), 'ovpn-sdk-helper-'));
+    try {
+      const helper = path.join(dir, 'elevate-helper.mjs');
+      await writeFile(helper, '// stand-in for elevate-helper.js\n', 'utf8');
+      const client = new OpenVpnClient('dev null\n', {
+        binary: process.execPath,
+        adapterManager: new FakeAdapterManager(),
+        elevationHelperPath: helper,
+        elevation: 'always',
+      });
+
+      const broker = (
+        client as unknown as { getBroker(): ElevatedBrokerLike & { helperPath: string } }
+      ).getBroker();
+      try {
+        assert.equal(broker.helperPath, path.resolve(helper));
+      } finally {
+        await broker.dispose();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails fast when the elevation helper is missing', async () => {
+    const fakeManager = new FakeProcessManager();
+    const client = new OpenVpnClient('dev null\n', {
+      binary: process.execPath,
+      processManager: fakeManager,
+      adapterManager: new FakeAdapterManager(),
+      managementPort: 1,
+      disconnectTimeoutMs: 20,
+      manageAdapter: false,
+      elevation: 'always',
+      elevationHelperPath: path.join(tmpdir(), 'ovpn-sdk-missing', 'elevate-helper.js'),
+    });
+
+    await assert.rejects(
+      () => client.connect(),
+      (err: unknown) => {
+        assert.ok(err instanceof ElevationUnavailableError, String(err));
+        assert.match(err.message, /elevation helper/);
+        return true;
+      },
+    );
+    assert.equal(fakeManager.started.length, 0);
+    assert.equal(client.currentState, null);
   });
 });
 

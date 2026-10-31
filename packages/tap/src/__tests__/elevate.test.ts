@@ -1,13 +1,22 @@
 import assert from 'node:assert/strict';
+import { existsSync, realpathSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import {
   ElevatedBroker,
   ElevationCancelledError,
   ElevationError,
   ElevationUnavailableError,
+  buildAppleScriptLaunchCommand,
+  buildElectronElevatedLaunchCommand,
   buildElevatedLaunchCommand,
+  buildPosixLaunchCommand,
   isElevated,
+  resolveElevationHelperPath,
   type ElevatedLaunchOptions,
 } from '../elevate.ts';
 
@@ -88,6 +97,23 @@ function destroyAll(helper: FakeHelper): void {
   for (const socket of helper.sockets) socket.destroy();
 }
 
+/** Create a scratch directory and run `body` with it, always cleaning up. */
+async function withTempDir<T>(prefix: string, body: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await mkdtemp(path.join(tmpdir(), prefix));
+  try {
+    return await body(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Write a dummy helper file and return its absolute path. */
+async function writeHelper(file: string): Promise<string> {
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, '// stand-in for elevate-helper.js\n', 'utf8');
+  return file;
+}
+
 describe('buildElevatedLaunchCommand', () => {
   it('elevates node with the helper arguments by default', () => {
     const command = buildElevatedLaunchCommand({
@@ -132,16 +158,214 @@ describe('buildElevatedLaunchCommand', () => {
   });
 });
 
-describe('isElevated', { skip: process.platform === 'win32' && 'Windows uses the net session probe' }, () => {
-  it('reflects the effective uid on POSIX', async () => {
-    assert.equal(await isElevated(), process.getuid?.() === 0);
+describe('buildElectronElevatedLaunchCommand', () => {
+  it('runs the helper under Electron as Node with ELECTRON_RUN_AS_NODE', () => {
+    const command = buildElectronElevatedLaunchCommand({
+      nodePath: 'C:\\Program Files\\Acme\\Acme.exe',
+      helperPath: 'C:\\Program Files\\Acme\\resources\\app.asar.unpacked\\out\\main\\elevate-helper.mjs',
+      port: 4321,
+      token: 'abc123',
+    });
+    assert.equal(command.targetFile, 'C:\\Program Files\\Acme\\Acme.exe');
+    assert.match(command.powerShellScript, /-Verb RunAs/);
+    assert.match(command.powerShellScript, /WindowsPowerShell/);
+
+    const encoded = command.powerShellScript.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)?.[1];
+    assert.ok(encoded, 'outer script carries an encoded inner command');
+    const inner = Buffer.from(encoded, 'base64').toString('utf16le');
+    assert.match(inner, /ELECTRON_RUN_AS_NODE = '1'/);
+    assert.ok(inner.includes(String.raw`FilePath 'C:\Program Files\Acme\Acme.exe'`));
+    assert.ok(inner.includes('elevate-helper.mjs'));
   });
 });
 
-describe('Default launcher', { skip: process.platform === 'win32' && 'Windows uses PowerShell/UAC' }, () => {
-  it('reports UAC as unavailable off Windows', async () => {
-    const broker = new ElevatedBroker({ handshakeTimeoutMs: 200 });
-    await assert.rejects(() => broker.run('tapctl.exe', ['list']), ElevationUnavailableError);
+describe('buildPosixLaunchCommand', () => {
+  it('runs node with the helper arguments', () => {
+    const command = buildPosixLaunchCommand({
+      nodePath: '/usr/bin/node',
+      helperPath: '/opt/OpenVPN/elevate-helper.js',
+      port: 4321,
+      token: 'abc123',
+    });
+    assert.equal(command, '/usr/bin/node /opt/OpenVPN/elevate-helper.js --port 4321 --token abc123');
+  });
+
+  it('quotes paths with spaces and single quotes', () => {
+    const command = buildPosixLaunchCommand({
+      nodePath: '/opt/My Node/node',
+      helperPath: "/opt/it's/helper.js",
+      port: 1,
+      token: 't',
+    });
+    assert.equal(command, "'/opt/My Node/node' '/opt/it'\\''s/helper.js' --port 1 --token t");
+  });
+});
+
+describe('buildAppleScriptLaunchCommand', () => {
+  it('wraps the root command with administrator privileges', () => {
+    const script = buildAppleScriptLaunchCommand({
+      nodePath: '/usr/bin/node',
+      helperPath: '/tmp/elevate-helper.js',
+      port: 1,
+      token: 't',
+    });
+    assert.equal(
+      script,
+      'do shell script "/usr/bin/node /tmp/elevate-helper.js --port 1 --token t" with administrator privileges',
+    );
+  });
+});
+
+describe('resolveElevationHelperPath', () => {
+  it('finds the helper shipped next to the module', () => {
+    const resolved = resolveElevationHelperPath();
+    assert.ok(existsSync(resolved), `expected an existing helper, got ${resolved}`);
+    assert.match(path.basename(resolved), /^elevate-helper\.(mjs|js|ts)$/);
+  });
+
+  it('returns an explicit helper path unchanged', async () => {
+    await withTempDir('ovpn-helper-', async (dir) => {
+      const helper = await writeHelper(path.join(dir, 'nested', 'elevate-helper.mjs'));
+      assert.equal(
+        resolveElevationHelperPath({ helperPath: helper }),
+        path.resolve(helper),
+      );
+    });
+  });
+
+  it('fails fast and lists the checked paths when the explicit helper is missing', async () => {
+    await withTempDir('ovpn-helper-missing-', async (dir) => {
+      const missing = path.join(dir, 'does-not-exist', 'elevate-helper.js');
+      assert.throws(
+        () => resolveElevationHelperPath({ helperPath: missing }),
+        (err: unknown) => {
+          assert.ok(err instanceof ElevationUnavailableError, String(err));
+          assert.match(err.message, /elevationHelperPath/);
+          assert.ok(err.message.includes(path.resolve(missing)), err.message);
+          return true;
+        },
+      );
+    });
+  });
+
+  it('resolves the installed package when a bundler inlined the SDK', async () => {
+    // Simulates an electron-vite/rollup build: the host entry is out/main/index.js
+    // and the SDK only exists as an installed package under node_modules/.
+    await withTempDir('ovpn-helper-bundled-', async (dir) => {
+      const packageRoot = path.join(dir, 'node_modules', 'openvpn-node-sdk');
+      const helper = await writeHelper(
+        path.join(packageRoot, 'dist', 'tap', 'src', 'elevate-helper.mjs'),
+      );
+      await writeFile(
+        path.join(packageRoot, 'package.json'),
+        JSON.stringify({
+          name: 'openvpn-node-sdk',
+          type: 'module',
+          exports: {
+            '.': './dist/openvpn-sdk/src/index.js',
+            './elevate-helper': './dist/tap/src/elevate-helper.mjs',
+          },
+        }),
+        'utf8',
+      );
+      const hostBundle = path.join(dir, 'out', 'main', 'index.js');
+      await mkdir(path.dirname(hostBundle), { recursive: true });
+      await writeFile(hostBundle, '// bundled host entry\n', 'utf8');
+
+      assert.equal(
+        resolveElevationHelperPath({ moduleUrl: pathToFileURL(hostBundle) }),
+        realpathSync(helper),
+      );
+    });
+  });
+
+  it('prefers the asarUnpack copy of a helper inside app.asar', async () => {
+    await withTempDir('ovpn-helper-asar-', async (dir) => {
+      const resources = path.join(dir, 'resources');
+      const archiveDir = path.join(resources, 'app.asar', 'out', 'main');
+      await mkdir(archiveDir, { recursive: true });
+      const unpacked = await writeHelper(
+        path.join(resources, 'app.asar.unpacked', 'out', 'main', 'elevate-helper.mjs'),
+      );
+
+      assert.equal(
+        resolveElevationHelperPath({ moduleUrl: pathToFileURL(path.join(archiveDir, 'index.js')) }),
+        path.resolve(unpacked),
+      );
+    });
+  });
+
+  it('rejects a helper that only exists inside app.asar (Electron)', async () => {
+    await withTempDir('ovpn-helper-asar-only-', async (dir) => {
+      const archiveDir = path.join(dir, 'resources', 'app.asar', 'out', 'main');
+      await writeHelper(path.join(archiveDir, 'elevate-helper.mjs'));
+
+      const versions = process.versions as unknown as Record<string, string | undefined>;
+      const previous = versions.electron;
+      versions.electron = '42.0.0';
+      try {
+        assert.throws(
+          () => resolveElevationHelperPath({ moduleUrl: pathToFileURL(path.join(archiveDir, 'index.js')) }),
+          (err: unknown) => {
+            assert.ok(err instanceof ElevationUnavailableError, String(err));
+            assert.match(err.message, /app\.asar/);
+            assert.match(err.message, /asarUnpack/);
+            return true;
+          },
+        );
+      } finally {
+        if (previous === undefined) delete versions.electron;
+        else versions.electron = previous;
+      }
+    });
+  });
+});
+
+describe('ElevatedBroker helper resolution', () => {
+  it('uses an explicit helper path', async () => {
+    await withTempDir('ovpn-broker-', async (dir) => {
+      const helper = await writeHelper(path.join(dir, 'elevate-helper.mjs'));
+      const broker = new ElevatedBroker({ helperPath: helper });
+      try {
+        assert.equal(broker.helperPath, path.resolve(helper));
+      } finally {
+        await broker.dispose();
+      }
+    });
+  });
+
+  it('throws immediately for a helper path that does not exist', () => {
+    assert.throws(
+      () => new ElevatedBroker({ helperPath: path.join(tmpdir(), 'ovpn-missing-helper', 'elevate-helper.js') }),
+      (err: unknown) => {
+        assert.ok(err instanceof ElevationUnavailableError, String(err));
+        assert.match(err.message, /was not found/);
+        return true;
+      },
+    );
+  });
+
+  it('includes the helper path in the handshake timeout error', async () => {
+    const broker = new ElevatedBroker({
+      launch: async () => {},
+      handshakeTimeoutMs: 50,
+      helperPath: resolveElevationHelperPath(),
+    });
+    await assert.rejects(
+      () => broker.run('tapctl.exe', ['list']),
+      (err: unknown) => {
+        assert.ok(err instanceof ElevationError, String(err));
+        assert.match(err.message, /did not connect back/);
+        assert.ok(err.message.includes(broker.helperPath), err.message);
+        return true;
+      },
+    );
+  });
+});
+
+describe('isElevated', { skip: process.platform === 'win32' && 'Windows uses the net session probe' }, () => {
+  it('reflects the effective uid on POSIX', async () => {
+    assert.equal(await isElevated(), process.getuid?.() === 0);
   });
 });
 
