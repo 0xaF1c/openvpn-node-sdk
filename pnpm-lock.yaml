@@ -25,23 +25,7 @@ importers:
 
   packages/core: {}
 
-  packages/openvpn-sdk:
-    dependencies:
-      '@ovpn-sdk/binary':
-        specifier: 0.1.0
-        version: link:../binary
-      '@ovpn-sdk/config':
-        specifier: 0.1.0
-        version: link:../config
-      '@ovpn-sdk/core':
-        specifier: 0.1.0
-        version: link:../core
-      '@ovpn-sdk/process':
-        specifier: 0.1.0
-        version: link:../process
-      '@ovpn-sdk/tap':
-        specifier: 0.1.0
-        version: link:../tap
+  packages/openvpn-sdk: {}
 
   packages/process: {}
 
