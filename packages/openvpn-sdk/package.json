@@ -1,6 +1,6 @@
 {
   "name": "openvpn-node-sdk",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "High-level OpenVPN Node.js SDK facade",
   "license": "MIT",
   "type": "module",
